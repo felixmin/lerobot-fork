@@ -349,8 +349,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        grad_accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1)))
+        effective_bs = cfg.batch_size * grad_accum_steps * num_processes
+        if grad_accum_steps > 1:
+            logging.info(
+                f"Effective batch size: {cfg.batch_size} x {grad_accum_steps} x {num_processes} = {effective_bs}"
+            )
+        else:
+            logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -396,8 +402,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
 
+    grad_accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1)))
     # Use effective batch size for proper epoch calculation in distributed training
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    effective_batch_size = cfg.batch_size * grad_accum_steps * accelerator.num_processes
     train_tracker = MetricsTracker(
         effective_batch_size,
         dataset.num_frames,
@@ -412,65 +419,184 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    for _ in range(step, cfg.steps):
+    while step < cfg.steps:
         start_time = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
+        policy.train()
 
-        # Generate LAQ codes for latent_smol (only when head_mode=latent)
-        if laq_teacher is not None:
-            from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+        dataloading_total_s = 0.0
+        output_dict = {}
 
-            # Disable autocast to avoid fp16/bf16 surprises with LAQ
-            with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
-                camera_key = cfg.policy.laq_camera_key
-                if camera_key not in batch:
-                    image_keys = sorted([k for k in batch.keys() if k.startswith("observation.images.")])
-                    raise KeyError(
-                        f"LAQ teacher camera key '{camera_key}' not found in batch. "
-                        f"Available image keys: {image_keys}. "
-                        "Set --policy.laq_camera_key=<one of the available image keys>."
-                    )
-                frames = batch[camera_key]
+        if grad_accum_steps > 1:
+            output_sums: dict[str, float] = {}
+            output_counts: dict[str, int] = {}
+            loss_sum = 0.0
 
-                # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
-                if frames.shape[-1] == 3:  # [B, 2, H, W, C]
-                    frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
-                assert frames.shape[2] == 3, f"Expected C=3, got shape {frames.shape}"
+            optimizer.zero_grad()
 
-                # Default is_pad on same device as frames
-                is_pad = batch.get(
-                    f"{camera_key}_is_pad",
-                    torch.zeros(frames.shape[:2], dtype=torch.bool, device=frames.device)
+            for micro_idx in range(grad_accum_steps):
+                data_start = time.perf_counter()
+                batch = next(dl_iter)
+                batch = preprocessor(batch)
+
+                # Generate LAQ codes for latent_smol (only when head_mode=latent)
+                if laq_teacher is not None:
+                    from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+
+                    # Disable autocast to avoid fp16/bf16 surprises with LAQ
+                    with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
+                        camera_key = cfg.policy.laq_camera_key
+                        if camera_key not in batch:
+                            image_keys = sorted([k for k in batch.keys() if k.startswith("observation.images.")])
+                            raise KeyError(
+                                f"LAQ teacher camera key '{camera_key}' not found in batch. "
+                                f"Available image keys: {image_keys}. "
+                                "Set --policy.laq_camera_key=<one of the available image keys>."
+                            )
+                        frames = batch[camera_key]
+
+                        # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
+                        if frames.shape[-1] == 3:  # [B, 2, H, W, C]
+                            frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
+                        assert frames.shape[2] == 3, f"Expected C=3, got shape {frames.shape}"
+
+                        # Default is_pad on same device as frames
+                        is_pad = batch.get(
+                            f"{camera_key}_is_pad",
+                            torch.zeros(frames.shape[:2], dtype=torch.bool, device=frames.device),
+                        )
+
+                        valid_pair = valid_pair_from_is_pad(is_pad)
+
+                        # Resize to LAQ input size (use reshape for non-contiguous safety)
+                        B, T, C, H, W = frames.shape
+                        resize_hw = cfg.policy.laq_resize_hw
+                        frames_flat = frames.reshape(B * T, C, H, W)
+                        frames_resized = F.interpolate(
+                            frames_flat, size=resize_hw, mode="bilinear", align_corners=False
+                        )
+                        frames = frames_resized.reshape(B, T, C, *resize_hw)
+
+                        # frames already on device after preprocessor (DeviceProcessorStep)
+                        codes = laq_teacher.codes_from_pair(frames)  # [B, 4]
+
+                        batch["laq_codes"] = codes
+                        batch["laq_valid_pair"] = valid_pair.to(codes.device)  # Ensure same device
+
+                dataloading_total_s += time.perf_counter() - data_start
+
+                # Let accelerator handle mixed precision
+                with accelerator.autocast():
+                    # Get RA-BC weights if enabled
+                    rabc_batch_weights = None
+                    rabc_batch_stats = None
+                    if rabc_weights is not None:
+                        rabc_batch_weights, rabc_batch_stats = rabc_weights.compute_batch_weights(batch)
+
+                    # Use per-sample loss when RA-BC is enabled for proper weighting
+                    if rabc_batch_weights is not None:
+                        per_sample_loss, output_dict_local = policy.forward(batch, reduction="none")
+                        epsilon = 1e-6
+                        loss = (per_sample_loss * rabc_batch_weights).sum() / (
+                            rabc_batch_weights.sum() + epsilon
+                        )
+                        output_dict_local["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+                        output_dict_local["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+                        output_dict_local["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+                    else:
+                        loss, output_dict_local = policy.forward(batch)
+
+                loss_sum += float(loss.item())
+                accelerator.backward(loss / grad_accum_steps)
+
+                if output_dict_local:
+                    for k, v in output_dict_local.items():
+                        if k.startswith("_"):
+                            continue
+                        if isinstance(v, (int, float)):
+                            output_sums[k] = output_sums.get(k, 0.0) + float(v)
+                            output_counts[k] = output_counts.get(k, 0) + 1
+
+            # Clip gradients if specified
+            if cfg.optimizer.grad_clip_norm > 0:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), float("inf"), error_if_nonfinite=False
                 )
 
-                valid_pair = valid_pair_from_is_pad(is_pad)
+            optimizer.step()
+            optimizer.zero_grad()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
-                # Resize to LAQ input size (use reshape for non-contiguous safety)
-                B, T, C, H, W = frames.shape
-                resize_hw = cfg.policy.laq_resize_hw
-                frames_flat = frames.reshape(B * T, C, H, W)
-                frames_resized = F.interpolate(frames_flat, size=resize_hw, mode="bilinear", align_corners=False)
-                frames = frames_resized.reshape(B, T, C, *resize_hw)
+            if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+                accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-                # frames already on device after preprocessor (DeviceProcessorStep)
-                codes = laq_teacher.codes_from_pair(frames)  # [B, 4]
+            train_tracker.loss = loss_sum / grad_accum_steps
+            train_tracker.grad_norm = grad_norm.item()
+            train_tracker.lr = optimizer.param_groups[0]["lr"]
+            train_tracker.update_s = time.perf_counter() - start_time
+            train_tracker.dataloading_s = dataloading_total_s
 
-                batch["laq_codes"] = codes
-                batch["laq_valid_pair"] = valid_pair.to(codes.device)  # Ensure same device
+            output_dict = {k: output_sums[k] / max(1, output_counts[k]) for k in output_sums}
+        else:
+            batch = next(dl_iter)
+            batch = preprocessor(batch)
 
-        train_tracker.dataloading_s = time.perf_counter() - start_time
+            # Generate LAQ codes for latent_smol (only when head_mode=latent)
+            if laq_teacher is not None:
+                from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            rabc_weights_provider=rabc_weights,
-        )
+                # Disable autocast to avoid fp16/bf16 surprises with LAQ
+                with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
+                    camera_key = cfg.policy.laq_camera_key
+                    if camera_key not in batch:
+                        image_keys = sorted([k for k in batch.keys() if k.startswith("observation.images.")])
+                        raise KeyError(
+                            f"LAQ teacher camera key '{camera_key}' not found in batch. "
+                            f"Available image keys: {image_keys}. "
+                            "Set --policy.laq_camera_key=<one of the available image keys>."
+                        )
+                    frames = batch[camera_key]
+
+                    # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
+                    if frames.shape[-1] == 3:  # [B, 2, H, W, C]
+                        frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
+                    assert frames.shape[2] == 3, f"Expected C=3, got shape {frames.shape}"
+
+                    # Default is_pad on same device as frames
+                    is_pad = batch.get(
+                        f"{camera_key}_is_pad",
+                        torch.zeros(frames.shape[:2], dtype=torch.bool, device=frames.device),
+                    )
+
+                    valid_pair = valid_pair_from_is_pad(is_pad)
+
+                    # Resize to LAQ input size (use reshape for non-contiguous safety)
+                    B, T, C, H, W = frames.shape
+                    resize_hw = cfg.policy.laq_resize_hw
+                    frames_flat = frames.reshape(B * T, C, H, W)
+                    frames_resized = F.interpolate(frames_flat, size=resize_hw, mode="bilinear", align_corners=False)
+                    frames = frames_resized.reshape(B, T, C, *resize_hw)
+
+                    # frames already on device after preprocessor (DeviceProcessorStep)
+                    codes = laq_teacher.codes_from_pair(frames)  # [B, 4]
+
+                    batch["laq_codes"] = codes
+                    batch["laq_valid_pair"] = valid_pair.to(codes.device)  # Ensure same device
+
+            train_tracker.dataloading_s = time.perf_counter() - start_time
+
+            train_tracker, output_dict = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                lr_scheduler=lr_scheduler,
+                rabc_weights_provider=rabc_weights,
+            )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.

@@ -53,6 +53,9 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Gradient accumulation steps. Effective batch size per optimizer update is:
+    # batch_size * grad_accum_steps * num_processes.
+    grad_accum_steps: int = 1
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
