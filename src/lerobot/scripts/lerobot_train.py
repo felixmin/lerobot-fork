@@ -493,55 +493,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
 
-                # LAQ visualization (every 100 steps)
-                if laq_teacher is not None and step % 100 == 0:
-                    try:
-                        import wandb
-                        from PIL import Image
-                        import numpy as np
-
-                        camera_key = cfg.policy.laq_camera_key
-                        frames = batch.get(camera_key)
-                        if frames is not None and "_codes_gt" in output_dict:
-                            # Get first valid sample for visualization
-                            valid_mask = output_dict.get("_valid_mask")
-                            if valid_mask is not None and valid_mask.any():
-                                idx = valid_mask.nonzero()[0].item()
-
-                                # Get frame pair [2, C, H, W]
-                                frame_pair = frames[idx].cpu()
-                                if frame_pair.shape[-1] == 3:  # [2, H, W, C]
-                                    frame_pair = frame_pair.permute(0, 3, 1, 2)
-
-                                # Convert to images
-                                frame_t = (frame_pair[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                                frame_delta = (frame_pair[1].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-                                # Get codes
-                                codes_gt = output_dict["_codes_gt"][idx].cpu().tolist()
-                                logits = output_dict["_logits"][idx].cpu()  # [S, K]
-                                codes_pred = logits.argmax(dim=-1).tolist()
-                                probs = F.softmax(logits, dim=-1)
-
-                                # Create caption
-                                caption = f"GT: {codes_gt} | Pred: {codes_pred}"
-
-                                # Log images using raw wandb.log() (wrapper doesn't handle Image/Table)
-                                wandb.log({
-                                    "laq_viz/frame_t": wandb.Image(frame_t, caption="Frame t"),
-                                    "laq_viz/frame_delta": wandb.Image(frame_delta, caption="Frame t+Δ"),
-                                    "laq_viz/codes": wandb.Table(
-                                        columns=["pos", "gt", "pred", "match"] + [f"p{i}" for i in range(probs.shape[-1])],
-                                        data=[
-                                            [i, codes_gt[i], codes_pred[i], "✓" if codes_gt[i] == codes_pred[i] else "✗"]
-                                            + probs[i].tolist()
-                                            for i in range(len(codes_gt))
-                                        ]
-                                    ),
-                                }, step=step)
-                    except Exception as e:
-                        logging.warning(f"LAQ visualization failed: {e}")
-
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:

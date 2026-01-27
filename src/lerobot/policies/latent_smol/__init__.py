@@ -12,18 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LatentSmol policy - SmolVLA variant with Mode A (latent pretraining) support."""
+"""LatentSmol policy package.
 
-from lerobot.policies.latent_smol.configuration_latent_smol import LatentSmolConfig
-from lerobot.policies.latent_smol.modeling_latent_smol import LatentSmolPolicy
-from lerobot.policies.latent_smol.processor_latent_smol import (
-    LatentSmolNewLineProcessor,
-    make_latent_smol_pre_post_processors,
-)
+Keep this module lightweight: importing config submodules should not eagerly import
+heavy dependencies (e.g. transformers) via the policy model.
+"""
 
-__all__ = [
-    "LatentSmolConfig",
-    "LatentSmolPolicy",
-    "LatentSmolNewLineProcessor",
-    "make_latent_smol_pre_post_processors",
-]
+from .configuration_latent_smol import LatentSmolConfig as LatentSmolConfig
+
+__all__ = ["LatentSmolConfig"]
+
