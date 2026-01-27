@@ -88,6 +88,14 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+
+        # Compute laq_future_frames for latent_smol in latent mode before resolving delta timestamps
+        if (getattr(cfg.policy, 'type', None) == "latent_smol" and
+            getattr(cfg.policy, 'head_mode', None) == "latent" and
+            getattr(cfg.policy, 'laq_future_frames', 0) <= 0):
+            cfg.policy.laq_future_frames = max(1, round(ds_meta.fps * cfg.policy.laq_future_seconds))
+            logging.info(f"Computed laq_future_frames={cfg.policy.laq_future_frames} (fps={ds_meta.fps})")
+
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(

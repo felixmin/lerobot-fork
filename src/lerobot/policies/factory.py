@@ -39,6 +39,7 @@ from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.latent_smol.configuration_latent_smol import LatentSmolConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
@@ -131,6 +132,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
+    elif name == "latent_smol":
+        from lerobot.policies.latent_smol.modeling_latent_smol import LatentSmolPolicy
+
+        return LatentSmolPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -181,6 +186,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
+    elif policy_type == "latent_smol":
+        return LatentSmolConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -345,6 +352,15 @@ def make_pre_post_processors(
         from lerobot.policies.sac.reward_model.processor_classifier import make_classifier_processor
 
         processors = make_classifier_processor(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, LatentSmolConfig):
+        # Must check LatentSmolConfig before SmolVLAConfig since it inherits from it
+        from lerobot.policies.latent_smol.processor_latent_smol import make_latent_smol_pre_post_processors
+
+        processors = make_latent_smol_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

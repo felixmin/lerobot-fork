@@ -14,7 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import traceback
+from pathlib import Path
+
+# Ensure local `src/` is imported when running tests from a repo checkout.
+# Otherwise, pytest may pick up a site-packages `lerobot` installation and miss local changes.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if _SRC_ROOT.exists():
+    sys.path.insert(0, str(_SRC_ROOT))
 
 import pytest
 from serial import SerialException

@@ -21,6 +21,7 @@ from pprint import pformat
 from typing import Any
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -311,6 +312,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             device=device,
         )
 
+    # Initialize LAQ teacher for latent_smol in latent mode
+    laq_teacher = None
+    if (cfg.policy.type == "latent_smol" and
+        getattr(cfg.policy, 'head_mode', 'action') == "latent"):
+        from lerobot.teachers.laq_teacher import LAQTeacher, LAQTeacherConfig
+
+        if cfg.policy.laq_checkpoint_path is None:
+            raise ValueError("laq_checkpoint_path required for head_mode='latent'")
+
+        laq_teacher = LAQTeacher(LAQTeacherConfig(
+            checkpoint_path=cfg.policy.laq_checkpoint_path,
+            device=str(device),
+        ))
+        laq_teacher.eval()
+        if is_main_process:
+            logging.info(f"LAQ Teacher: K={laq_teacher.codebook_size}, S={laq_teacher.code_seq_len}")
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -398,6 +416,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         batch = preprocessor(batch)
+
+        # Generate LAQ codes for latent_smol (only when head_mode=latent)
+        if laq_teacher is not None:
+            from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+
+            # Disable autocast to avoid fp16/bf16 surprises with LAQ
+            with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
+                camera_key = cfg.policy.laq_camera_key
+                frames = batch[camera_key]
+
+                # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
+                if frames.shape[-1] == 3:  # [B, 2, H, W, C]
+                    frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
+                assert frames.shape[2] == 3, f"Expected C=3, got shape {frames.shape}"
+
+                # Default is_pad on same device as frames
+                is_pad = batch.get(
+                    f"{camera_key}_is_pad",
+                    torch.zeros(frames.shape[:2], dtype=torch.bool, device=frames.device)
+                )
+
+                valid_pair = valid_pair_from_is_pad(is_pad)
+
+                # Resize to LAQ input size (use reshape for non-contiguous safety)
+                B, T, C, H, W = frames.shape
+                resize_hw = cfg.policy.laq_resize_hw
+                frames_flat = frames.reshape(B * T, C, H, W)
+                frames_resized = F.interpolate(frames_flat, size=resize_hw, mode="bilinear", align_corners=False)
+                frames = frames_resized.reshape(B, T, C, *resize_hw)
+
+                # frames already on device after preprocessor (DeviceProcessorStep)
+                codes = laq_teacher.codes_from_pair(frames)  # [B, 4]
+
+                batch["laq_codes"] = codes
+                batch["laq_valid_pair"] = valid_pair.to(codes.device)  # Ensure same device
+
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -424,7 +478,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
-                    wandb_log_dict.update(output_dict)
+                    # Filter out internal tensors (prefixed with _) from scalar logging
+                    scalar_dict = {k: v for k, v in output_dict.items() if not k.startswith("_")}
+                    wandb_log_dict.update(scalar_dict)
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()
@@ -436,6 +492,56 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         }
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
+
+                # LAQ visualization (every 100 steps)
+                if laq_teacher is not None and step % 100 == 0:
+                    try:
+                        import wandb
+                        from PIL import Image
+                        import numpy as np
+
+                        camera_key = cfg.policy.laq_camera_key
+                        frames = batch.get(camera_key)
+                        if frames is not None and "_codes_gt" in output_dict:
+                            # Get first valid sample for visualization
+                            valid_mask = output_dict.get("_valid_mask")
+                            if valid_mask is not None and valid_mask.any():
+                                idx = valid_mask.nonzero()[0].item()
+
+                                # Get frame pair [2, C, H, W]
+                                frame_pair = frames[idx].cpu()
+                                if frame_pair.shape[-1] == 3:  # [2, H, W, C]
+                                    frame_pair = frame_pair.permute(0, 3, 1, 2)
+
+                                # Convert to images
+                                frame_t = (frame_pair[0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                                frame_delta = (frame_pair[1].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+                                # Get codes
+                                codes_gt = output_dict["_codes_gt"][idx].cpu().tolist()
+                                logits = output_dict["_logits"][idx].cpu()  # [S, K]
+                                codes_pred = logits.argmax(dim=-1).tolist()
+                                probs = F.softmax(logits, dim=-1)
+
+                                # Create caption
+                                caption = f"GT: {codes_gt} | Pred: {codes_pred}"
+
+                                # Log images using raw wandb.log() (wrapper doesn't handle Image/Table)
+                                wandb.log({
+                                    "laq_viz/frame_t": wandb.Image(frame_t, caption="Frame t"),
+                                    "laq_viz/frame_delta": wandb.Image(frame_delta, caption="Frame t+Δ"),
+                                    "laq_viz/codes": wandb.Table(
+                                        columns=["pos", "gt", "pred", "match"] + [f"p{i}" for i in range(probs.shape[-1])],
+                                        data=[
+                                            [i, codes_gt[i], codes_pred[i], "✓" if codes_gt[i] == codes_pred[i] else "✗"]
+                                            + probs[i].tolist()
+                                            for i in range(len(codes_gt))
+                                        ]
+                                    ),
+                                }, step=step)
+                    except Exception as e:
+                        logging.warning(f"LAQ visualization failed: {e}")
+
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
