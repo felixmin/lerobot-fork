@@ -1,0 +1,198 @@
+# LatentSmol runbook (LAQ latent pretraining → action finetune)
+
+This document is a copy/paste runbook for starting and resuming `latent_smol` runs while ensuring:
+
+- We run inside `conda` env `lerobhl`
+- We use the shared HF caches under `/mnt/data/tmp/hf` (cached dataset, hub downloads, transformers)
+- We use the *repo checkout* code (not a stale site-packages install)
+
+## 0) One-time environment setup
+
+Pick the same exports for every run (dataset caching + local code + HLRP packages):
+
+```bash
+export PYTHONPATH="/mnt/data/workspace/code/lerobot/src:/mnt/data/workspace/code/high-level-robot-planner/packages:${PYTHONPATH:-}"
+
+export HF_HOME=/mnt/data/tmp/hf
+export HF_HUB_CACHE=/mnt/data/tmp/hf/hub
+export HF_DATASETS_CACHE=/mnt/data/tmp/hf/datasets
+export TRANSFORMERS_CACHE=/mnt/data/tmp/hf/transformers  # (deprecated but still works)
+
+export HF_TOKEN="$(cat /home/felix/.cache/huggingface/token 2>/dev/null || true)"
+
+# WandB (non-interactive): pull API key from ~/.netrc if present
+export WANDB_API_KEY="${WANDB_API_KEY:-$(
+python - <<'PY'
+import netrc
+try:
+    n = netrc.netrc()
+except Exception:
+    print("")
+    raise SystemExit(0)
+for host in ("api.wandb.ai", "wandb.ai"):
+    auth = n.authenticators(host)
+    if auth and auth[2]:
+        print(auth[2])
+        break
+else:
+    print("")
+PY
+)}"
+```
+
+## 1) Sanity check: what camera keys does a dataset have?
+
+For `HuggingFaceVLA/libero`, the available camera keys are:
+
+```bash
+cd /mnt/data/workspace/code/lerobot && conda run -n lerobhl --no-capture-output bash -lc '
+export PYTHONPATH="/mnt/data/workspace/code/lerobot/src:${PYTHONPATH:-}"
+export HF_HOME=/mnt/data/tmp/hf
+python - << "PY"
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+m = LeRobotDatasetMetadata("HuggingFaceVLA/libero")
+print("fps:", m.fps)
+print("camera_keys:", m.camera_keys)
+print("features:", list(m.features))
+PY'
+```
+
+Use one of the printed `camera_keys` as `--policy.laq_camera_key=...`.
+
+## 2) Stage 1 (Mode A): latent pretraining on LAQ codes
+
+### Quick smoke run (recommended before any long run)
+
+```bash
+cd /mnt/data/workspace/code/lerobot && conda run -n lerobhl --no-capture-output bash -lc '
+set -euo pipefail
+export PYTHONPATH="/mnt/data/workspace/code/lerobot/src:/mnt/data/workspace/code/high-level-robot-planner/packages:${PYTHONPATH:-}"
+export HF_HOME=/mnt/data/tmp/hf
+export HF_HUB_CACHE=/mnt/data/tmp/hf/hub
+export HF_DATASETS_CACHE=/mnt/data/tmp/hf/datasets
+export TRANSFORMERS_CACHE=/mnt/data/tmp/hf/transformers
+export HF_TOKEN="$(cat /home/felix/.cache/huggingface/token 2>/dev/null || true)"
+
+python -m lerobot.scripts.lerobot_train \
+  --policy.type=latent_smol \
+  --policy.head_mode=latent \
+  --policy.laq_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/laq-stepstep052500.ckpt \
+  --policy.laq_camera_key=observation.images.image \
+  --policy.laq_future_seconds=1.0 \
+  --policy.load_vlm_weights=false \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=HuggingFaceVLA/libero \
+  --dataset.use_imagenet_stats=false \
+  --dataset.video_backend=pyav \
+  --batch_size=2 \
+  --num_workers=0 \
+  --steps=20 \
+  --log_freq=5 \
+  --save_checkpoint=false \
+  --eval_freq=0 \
+  --wandb.enable=false \
+  --output_dir=outputs/latent_smol_smoke_$(date +%Y%m%d_%H%M%S_%N)'
+```
+
+### Longer run (saves checkpoints)
+
+Notes:
+- Don’t `mkdir -p` the `--output_dir` beforehand: LeRobot errors if it already exists.
+- Checkpoints land in `OUTPUT_DIR/checkpoints/<step_id>/pretrained_model/`.
+- `OUTPUT_DIR/checkpoints/last` is a symlink to the most recent checkpoint step.
+
+```bash
+cd /mnt/data/workspace/code/lerobot && conda run -n lerobhl --no-capture-output bash -lc '
+set -euo pipefail
+export PYTHONPATH="/mnt/data/workspace/code/lerobot/src:/mnt/data/workspace/code/high-level-robot-planner/packages:${PYTHONPATH:-}"
+export HF_HOME=/mnt/data/tmp/hf
+export HF_HUB_CACHE=/mnt/data/tmp/hf/hub
+export HF_DATASETS_CACHE=/mnt/data/tmp/hf/datasets
+export TRANSFORMERS_CACHE=/mnt/data/tmp/hf/transformers
+export HF_TOKEN="$(cat /home/felix/.cache/huggingface/token 2>/dev/null || true)"
+
+python -m lerobot.scripts.lerobot_train \
+  --policy.type=latent_smol \
+  --policy.head_mode=latent \
+  --policy.laq_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/laq-stepstep052500.ckpt \
+  --policy.laq_camera_key=observation.images.image \
+  --policy.laq_future_seconds=1.0 \
+  --policy.load_vlm_weights=false \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=HuggingFaceVLA/libero \
+  --dataset.use_imagenet_stats=false \
+  --dataset.video_backend=pyav \
+  --batch_size=4 \
+  --num_workers=4 \
+  --steps=20000 \
+  --log_freq=50 \
+  --save_freq=2000 \
+  --eval_freq=0 \
+  --wandb.enable=true \
+  --wandb.project=lerobot \
+  --output_dir=outputs/latent_smol_stage1_$(date +%Y%m%d_%H%M%S_%N)'
+```
+
+### Resume a Stage 1 run
+
+```bash
+cd /mnt/data/workspace/code/lerobot && conda run -n lerobhl --no-capture-output bash -lc '
+set -euo pipefail
+export PYTHONPATH="/mnt/data/workspace/code/lerobot/src:/mnt/data/workspace/code/high-level-robot-planner/packages:${PYTHONPATH:-}"
+export HF_HOME=/mnt/data/tmp/hf
+export HF_HUB_CACHE=/mnt/data/tmp/hf/hub
+export HF_DATASETS_CACHE=/mnt/data/tmp/hf/datasets
+export TRANSFORMERS_CACHE=/mnt/data/tmp/hf/transformers
+export HF_TOKEN="$(cat /home/felix/.cache/huggingface/token 2>/dev/null || true)"
+
+python -m lerobot.scripts.lerobot_train \
+  --resume=true \
+  --config_path=outputs/<RUN_DIR>/checkpoints/last/pretrained_model/train_config.json \
+  --steps=40000'
+```
+
+## 3) Stage 2 (Mode B): action finetuning (load Stage 1 checkpoint)
+
+### Finetune from Stage 1 (latent_smol → action)
+
+Point `--policy.pretrained_path` to the *pretrained_model* folder inside a checkpoint:
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.type=latent_smol \
+  --policy.head_mode=action \
+  --policy.pretrained_path=outputs/<STAGE1_RUN_DIR>/checkpoints/last/pretrained_model \
+  --policy.load_vlm_weights=false \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=<ROBOT_DATASET_WITH_ACTIONS> \
+  --dataset.use_imagenet_stats=false \
+  --dataset.video_backend=pyav \
+  --batch_size=64 \
+  --steps=200000 \
+  --save_freq=20000 \
+  --log_freq=200 \
+  --eval_freq=1000 \
+  --eval.n_episodes=2 \
+  --wandb.enable=true \
+  --output_dir=outputs/latent_smol_stage2_$(date +%Y%m%d_%H%M%S_%N)
+```
+
+### Baseline: train from scratch (smolvla)
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.type=smolvla \
+  --policy.load_vlm_weights=false \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=<ROBOT_DATASET_WITH_ACTIONS> \
+  --dataset.use_imagenet_stats=false \
+  --dataset.video_backend=pyav \
+  --batch_size=64 \
+  --steps=200000 \
+  --save_freq=20000 \
+  --log_freq=200 \
+  --eval_freq=1000 \
+  --eval.n_episodes=2 \
+  --wandb.enable=true \
+  --output_dir=outputs/smolvla_scratch_$(date +%Y%m%d_%H%M%S_%N)
+```

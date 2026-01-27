@@ -424,6 +424,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             # Disable autocast to avoid fp16/bf16 surprises with LAQ
             with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
                 camera_key = cfg.policy.laq_camera_key
+                if camera_key not in batch:
+                    image_keys = sorted([k for k in batch.keys() if k.startswith("observation.images.")])
+                    raise KeyError(
+                        f"LAQ teacher camera key '{camera_key}' not found in batch. "
+                        f"Available image keys: {image_keys}. "
+                        "Set --policy.laq_camera_key=<one of the available image keys>."
+                    )
                 frames = batch[camera_key]
 
                 # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
