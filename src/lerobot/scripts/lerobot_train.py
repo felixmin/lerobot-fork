@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from accelerate import Accelerator
@@ -53,6 +54,7 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
 
 def update_policy(
@@ -147,6 +149,212 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def _to_uint8_hwc(img_chw: torch.Tensor) -> np.ndarray:
+    """Convert an image tensor [C,H,W] in [0,1] or [-1,1] to uint8 HWC."""
+    img = img_chw.detach().float().cpu()
+    if img.ndim != 3:
+        raise ValueError(f"Expected [C,H,W], got {tuple(img.shape)}")
+
+    if img.min().item() < 0.0:
+        img = (img + 1.0) / 2.0
+    img = img.clamp(0.0, 1.0)
+    img_hwc = img.permute(1, 2, 0).numpy()
+    return (img_hwc * 255.0).round().astype(np.uint8)
+
+
+def _decode_instructions(
+    tokenizer: Any | None,
+    token_ids: torch.Tensor | None,
+    attn_mask: torch.Tensor | None,
+    num_samples: int,
+) -> list[str]:
+    if tokenizer is None or token_ids is None:
+        return [""] * num_samples
+
+    token_ids_cpu = token_ids[:num_samples].detach().cpu()
+    mask_cpu = attn_mask[:num_samples].detach().cpu().bool() if attn_mask is not None else None
+
+    texts: list[str] = []
+    for i in range(token_ids_cpu.shape[0]):
+        ids = token_ids_cpu[i]
+        if mask_cpu is not None and mask_cpu.ndim == 2:
+            ids = ids[mask_cpu[i]]
+        texts.append(tokenizer.decode(ids.tolist(), skip_special_tokens=True).strip())
+    while len(texts) < num_samples:
+        texts.append("")
+    return texts
+
+
+def _build_laq_viz_table(
+    cfg: TrainPipelineConfig,
+    batch: dict[str, Any],
+    output_dict: dict[str, Any],
+    tokenizer: Any | None,
+    wandb: Any,
+    step: int,
+) -> Any:
+    """Create a small W&B table for LAQ latent pretraining debugging."""
+    num_samples = int(max(1, getattr(cfg, "laq_viz_num_samples", 4)))
+
+    # Instruction text
+    lang_tokens = batch.get(OBS_LANGUAGE_TOKENS)
+    lang_mask = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
+    instructions = _decode_instructions(tokenizer, lang_tokens, lang_mask, num_samples=num_samples)
+
+    # Images: (t=0, t=Δ) pair from laq_camera_key
+    camera_key = getattr(cfg.policy, "laq_camera_key", None) if cfg.policy is not None else None
+    frames = batch.get(camera_key) if camera_key else None
+    images: list[Any] = []
+    if isinstance(frames, torch.Tensor) and frames.ndim == 5:
+        frames_t = frames[:num_samples]
+        # Handle both [B, 2, C, H, W] and [B, 2, H, W, C]
+        if frames_t.shape[-1] == 3:
+            frames_t = frames_t.permute(0, 1, 4, 2, 3)
+        if frames_t.shape[2] == 3 and frames_t.shape[1] >= 2:
+            frames_cpu = frames_t.detach().cpu()
+            for i in range(frames_cpu.shape[0]):
+                img0 = _to_uint8_hwc(frames_cpu[i, 0])
+                img1 = _to_uint8_hwc(frames_cpu[i, 1])
+                images.append(wandb.Image(np.concatenate([img0, img1], axis=1)))
+
+    # GT + predicted codes
+    gt_codes_t = batch.get("laq_codes")
+    valid_pair_t = batch.get("laq_valid_pair")
+    logits_t = output_dict.get("_logits")
+
+    gt_codes = (
+        gt_codes_t[:num_samples].detach().cpu().long().tolist()
+        if isinstance(gt_codes_t, torch.Tensor) and gt_codes_t.ndim >= 2
+        else [[-1] * int(getattr(cfg.policy, "laq_code_seq_len", 4)) for _ in range(num_samples)]
+    )
+    valid_pair = (
+        valid_pair_t[:num_samples].detach().cpu().bool().tolist()
+        if isinstance(valid_pair_t, torch.Tensor) and valid_pair_t.ndim == 1
+        else [True] * num_samples
+    )
+
+    pred_codes: list[list[int]] = [[-1] * len(gt_codes[0]) for _ in range(num_samples)]
+    confidences: list[float] = [0.0 for _ in range(num_samples)]
+    if isinstance(logits_t, torch.Tensor) and logits_t.ndim == 3:
+        logits_cpu = logits_t[:num_samples].detach().cpu().float()  # [N, S, K]
+        pred = logits_cpu.argmax(dim=-1)  # [N, S]
+        pred_codes = pred.long().tolist()
+        probs = torch.softmax(logits_cpu, dim=-1)  # [N, S, K]
+        conf = probs.max(dim=-1).values.mean(dim=-1)  # [N]
+        confidences = conf.detach().cpu().tolist()
+
+    table = wandb.Table(
+        columns=[
+            "step",
+            "instruction",
+            "image_pair_t0_tΔ",
+            "gt_codes",
+            "pred_codes",
+            "valid_pair",
+            "mean_confidence",
+        ]
+    )
+
+    for i in range(num_samples):
+        img_cell = images[i] if i < len(images) else None
+        table.add_data(
+            step,
+            instructions[i],
+            img_cell,
+            str(gt_codes[i]),
+            str(pred_codes[i]),
+            bool(valid_pair[i]),
+            float(confidences[i]),
+        )
+    return table
+
+
+def get_default_peft_configuration(policy_type):
+    """Build a basic PEFT configuration for the given policy type assuming that we train a policy from a checkpoint."""
+
+    common_projections = "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+
+    if policy_type == "smolvla":
+        return {
+            "target_modules": rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))",
+            "modules_to_save": [],
+        }
+    elif policy_type in ("pi0", "pi05"):
+        return {
+            "target_modules": rf"(.*\.gemma_expert\..*\.self_attn.(q|v)_proj|model\.({common_projections}))",
+            "modules_to_save": [],
+        }
+
+    return {"modules_to_save": None}
+
+
+def wrap_policy_in_peft_model(cfg, policy):
+    from peft import PEFT_TYPE_TO_CONFIG_MAPPING, PeftType, get_peft_model
+
+    # Disable all gradients because we'll only train the parameters selected by the PEFT method.
+    # Layers that should receive gradients anyway need to be listed in `modules_to_save`.
+    for p in policy.parameters():
+        p.requires_grad_(False)
+
+    if not cfg.policy.pretrained_path:
+        raise ValueError(
+            "Training from scratch using PEFT. This is unlikely to yield good results. "
+            "Supply a `policy.path` to fine-tune an existing model."
+        )
+
+    if cfg.policy.type == "smolvla" and not cfg.policy.load_vlm_weights:
+        logging.warning(
+            "Training SmolVLA from scratch using PEFT. This is unlikely to yield good results. Set "
+            "`load_vlm_weights=True` to fine-tune the existing policy."
+        )
+
+    peft_config_policy = get_default_peft_configuration(cfg.policy.type)
+    peft_config_cli = dataclasses.asdict(cfg.peft) if cfg.peft else {}
+    peft_config_cli["modules_to_save"] = peft_config_cli["full_training_modules"]  # compatibility with PEFT
+    peft_method_type = PeftType[peft_config_cli["method_type"].upper()]
+    peft_config_cls = PEFT_TYPE_TO_CONFIG_MAPPING[peft_method_type]
+
+    # Handle specific CLI overrides
+    for key in ["target_modules", "modules_to_save", "r"]:
+        if peft_config_cli[key] is not None:
+            peft_config_policy[key] = peft_config_cli[key]
+
+    if "target_modules" not in peft_config_policy:
+        raise ValueError(
+            f"There is no default `target_modules` value for policy {cfg.policy.type}. Please pass it manually."
+        )
+
+    # Init method depends on the used PEFT method, your specific PEFT method
+    # might not be considered here, in that case an error is raised.
+    if peft_config_cli["init_type"] is not None:
+        if peft_method_type == "LORA":
+            peft_config_policy["init_lora_weights"] = peft_config_cli["init_type"]
+        elif peft_method_type == "MISS":
+            peft_config_policy["init_weights"] = peft_config_cli["init_type"]
+        else:
+            raise ValueError(
+                f"Init type {peft_config_cli['init_type']} unknown for PEFT method {peft_method_type}."
+            )
+
+    # PEFT uses this attribute to set adapter_config.base_name_or_path which we use for loading the
+    # correct base model in `make_policy` since in a PEFT loading setting we only get the path to the
+    # adapter, not the base model.
+    if policy.config.pretrained_path:
+        policy.name_or_path = str(policy.config.pretrained_path)
+
+    # Finally wrap the policy in a PEFT model
+    policy = get_peft_model(
+        policy,
+        peft_config_cls(**peft_config_policy),
+    )
+
+    # Make sure that the config is tagged as using PEFT so that the loading code can take the
+    # appropriate steps to use the adapter weights and the PEFT config instead of the full model weights.
+    policy.config.use_peft = True
+
+    return policy
 
 
 @parser.wrap()
@@ -329,6 +537,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if is_main_process:
             logging.info(f"LAQ Teacher: K={laq_teacher.codebook_size}, S={laq_teacher.code_seq_len}")
 
+    laq_viz_enabled = (
+        is_main_process
+        and wandb_logger is not None
+        and int(getattr(cfg, "laq_viz_freq", 0)) > 0
+        and cfg.policy.type == "latent_smol"
+        and getattr(cfg.policy, "head_mode", "action") == "latent"
+    )
+    laq_viz_wandb = wandb_logger._wandb if wandb_logger is not None else None
+    laq_viz_tokenizer = None
+    if laq_viz_enabled:
+        try:
+            # Cache the tokenizer once (used only for visualization)
+            laq_viz_tokenizer = policy.model.vlm_with_expert.processor.tokenizer
+        except Exception as e:
+            logging.warning(f"LAQ viz enabled but tokenizer lookup failed: {e}")
+            laq_viz_tokenizer = None
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -423,6 +648,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         start_time = time.perf_counter()
         policy.train()
 
+        next_step = step + 1
+        laq_viz_due = (
+            laq_viz_enabled
+            and laq_viz_wandb is not None
+            and next_step % int(getattr(cfg, "laq_viz_freq", 0)) == 0
+        )
+        laq_viz_table = None
+
         dataloading_total_s = 0.0
         output_dict = {}
 
@@ -504,6 +737,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         output_dict_local["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
                     else:
                         loss, output_dict_local = policy.forward(batch)
+
+                if laq_viz_due and laq_viz_table is None:
+                    try:
+                        laq_viz_table = _build_laq_viz_table(
+                            cfg=cfg,
+                            batch=batch,
+                            output_dict=output_dict_local,
+                            tokenizer=laq_viz_tokenizer,
+                            wandb=laq_viz_wandb,
+                            step=next_step,
+                        )
+                    except Exception as e:
+                        logging.warning(f"Failed to build LAQ viz table: {e}")
+                        laq_viz_table = None
 
                 loss_sum += float(loss.item())
                 accelerator.backward(loss / grad_accum_steps)
@@ -598,10 +845,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 rabc_weights_provider=rabc_weights,
             )
 
+            if laq_viz_due and laq_viz_table is None:
+                try:
+                    laq_viz_table = _build_laq_viz_table(
+                        cfg=cfg,
+                        batch=batch,
+                        output_dict=output_dict,
+                        tokenizer=laq_viz_tokenizer,
+                        wandb=laq_viz_wandb,
+                        step=next_step,
+                    )
+                except Exception as e:
+                    logging.warning(f"Failed to build LAQ viz table: {e}")
+                    laq_viz_table = None
+
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
         train_tracker.step()
+        if laq_viz_table is not None and laq_viz_wandb is not None:
+            laq_viz_wandb.log({"train/laq_viz": laq_viz_table}, step=step)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0

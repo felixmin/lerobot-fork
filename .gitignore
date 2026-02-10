@@ -87,6 +87,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 celerybeat-schedule
 celerybeat.pid
+nohup.out
 
 ### IDE & Editor Config ###
 # VS Code
