@@ -31,8 +31,8 @@ python -m lerobot.scripts.lerobot_train \
   --policy.type=latent_smol \
   --policy.head_mode=latent \
   --policy.laq_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/laq-stepstep052500.ckpt \
-  --policy.laq_camera_key=observation.images.top \
-  --policy.laq_future_seconds=1.0 \
+  --policy.lam_camera_keys=observation.images.top \
+  --policy.lam_future_seconds=1.0 \
   --policy.load_vlm_weights=false \
   --policy.push_to_hub=false \
   --dataset.repo_id=HuggingFaceVLA/libero \

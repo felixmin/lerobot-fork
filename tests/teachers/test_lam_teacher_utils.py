@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for LAQ teacher utility functions."""
+"""Unit tests for LAM teacher utility functions."""
 
 import pytest
 import torch
@@ -25,7 +25,7 @@ class TestValidPairFromIsPad:
 
     def test_valid_pair_from_is_pad_basic(self):
         """Test basic valid pair mask computation."""
-        from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+        from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
 
         # Test various combinations of padding
         is_pad = torch.tensor([
@@ -39,7 +39,7 @@ class TestValidPairFromIsPad:
 
     def test_valid_pair_from_is_pad_all_valid(self):
         """Test when all pairs are valid."""
-        from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+        from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
 
         is_pad = torch.tensor([
             [False, False],
@@ -52,7 +52,7 @@ class TestValidPairFromIsPad:
 
     def test_valid_pair_from_is_pad_none_valid(self):
         """Test when no pairs are valid."""
-        from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+        from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
 
         is_pad = torch.tensor([
             [True, False],
@@ -65,7 +65,7 @@ class TestValidPairFromIsPad:
 
     def test_valid_pair_from_is_pad_empty(self):
         """Test with empty batch."""
-        from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+        from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
 
         is_pad = torch.zeros(0, 2, dtype=torch.bool)
         valid = valid_pair_from_is_pad(is_pad)
@@ -73,7 +73,7 @@ class TestValidPairFromIsPad:
 
 
 class TestFramesPermutation:
-    """Tests for frame tensor permutation used in LAQ teacher."""
+    """Tests for frame tensor permutation used in LAM teacher."""
 
     def test_frames_permutation_shape(self):
         """Test that permutation produces correct shape for video format."""
@@ -109,20 +109,20 @@ class TestFramesPermutation:
             assert torch.allclose(video[b], torch.full_like(video[b], b))
 
 
-class TestLAQTeacherConfig:
-    """Tests for LAQTeacherConfig dataclass."""
+class TestLAMTeacherConfig:
+    """Tests for LAMTeacherConfig dataclass."""
 
     def test_config_defaults(self):
         """Test default configuration values."""
-        from lerobot.teachers.laq_teacher import LAQTeacherConfig
+        from lerobot.teachers.lam_teacher import LAMTeacherConfig
 
-        config = LAQTeacherConfig(checkpoint_path="/path/to/checkpoint")
+        config = LAMTeacherConfig(checkpoint_path="/path/to/checkpoint")
         assert config.checkpoint_path == "/path/to/checkpoint"
         assert config.device == "cuda"
 
     def test_config_custom_device(self):
         """Test custom device configuration."""
-        from lerobot.teachers.laq_teacher import LAQTeacherConfig
+        from lerobot.teachers.lam_teacher import LAMTeacherConfig
 
-        config = LAQTeacherConfig(checkpoint_path="/path/to/checkpoint", device="cpu")
+        config = LAMTeacherConfig(checkpoint_path="/path/to/checkpoint", device="cpu")
         assert config.device == "cpu"

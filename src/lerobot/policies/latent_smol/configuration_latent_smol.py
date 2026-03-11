@@ -26,7 +26,7 @@ class LatentSmolConfig(SmolVLAConfig):
     """LatentSmol config - inherits all SmolVLA fields, adds Mode A support.
 
     This config supports two training modes:
-    - head_mode="latent" (Mode A): Train VLM backbone on LAQ codes from (frame_t, frame_{t+delta})
+    - head_mode="latent" (Mode A): Train VLM backbone on LAM codes from (frame_t, frame_{t+delta})
     - head_mode="action" (Mode B): Standard action head training with flow-matching (same as SmolVLA)
 
     Workflow:
@@ -43,15 +43,15 @@ class LatentSmolConfig(SmolVLAConfig):
     # Mode selection
     head_mode: str = "latent"  # "latent" (Mode A) or "action" (Mode B)
 
-    # LAQ-specific (only used when head_mode="latent")
-    laq_checkpoint_path: str | None = None
-    laq_loss_weight: float = 1.0
-    laq_codebook_size: int = 8
-    laq_code_seq_len: int = 4
-    laq_future_seconds: float = 1.0
-    laq_future_frames: int = -1  # Computed from dataset fps at runtime
-    laq_camera_key: str = "observation.images.proprio"
-    laq_resize_hw: tuple[int, int] = (256, 256)
+    # LAM-specific (only used when head_mode="latent")
+    lam_checkpoint_path: str | None = None
+    lam_loss_weight: float = 1.0
+    lam_codebook_size: int = 8
+    lam_code_seq_len: int = 4
+    lam_future_seconds: float = 1.0
+    lam_future_frames: int = -1  # Computed from dataset fps at runtime
+    lam_camera_key: str = "observation.images.proprio"
+    lam_resize_hw: tuple[int, int] = (256, 256)
 
     @property
     def observation_delta_indices(self) -> list[int]:
@@ -61,10 +61,10 @@ class LatentSmolConfig(SmolVLAConfig):
         For action mode: returns [0] (single frame, same as SmolVLA)
         """
         if self.head_mode == "latent":
-            if self.laq_future_frames <= 0:
+            if self.lam_future_frames <= 0:
                 raise ValueError(
-                    "laq_future_frames must be >0 for head_mode='latent'. "
+                    "lam_future_frames must be >0 for head_mode='latent'. "
                     "This is computed automatically from dataset fps in make_dataset()."
                 )
-            return [0, self.laq_future_frames]
+            return [0, self.lam_future_frames]
         return [0]  # Mode B: single frame (inherit SmolVLA behavior)

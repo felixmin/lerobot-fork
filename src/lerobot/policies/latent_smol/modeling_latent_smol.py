@@ -18,11 +18,11 @@
 LatentSmol Policy:
 
 A variant of SmolVLA that supports two training modes:
-1. Mode A (head_mode="latent"): Latent pretraining with LAQ codes
+1. Mode A (head_mode="latent"): Latent pretraining with LAM codes
 2. Mode B (head_mode="action"): Standard action head training (same as SmolVLA)
 
 This enables a two-stage training workflow:
-- Stage 1: Pretrain backbone on video data using LAQ codes as targets
+- Stage 1: Pretrain backbone on video data using LAM codes as targets
 - Stage 2: Finetune on robot data with action head
 
 Usage:
@@ -30,7 +30,7 @@ Usage:
 # Stage 1: Latent pretraining
 policy = LatentSmolPolicy.from_pretrained(
     "lerobot/smolvla_base",
-    config=LatentSmolConfig(head_mode="latent", laq_checkpoint_path="...")
+    config=LatentSmolConfig(head_mode="latent", lam_checkpoint_path="...")
 )
 
 # Stage 2: Action finetuning
@@ -88,9 +88,9 @@ class LatentSmolFlowMatching(VLAFlowMatching):
         if config.head_mode == "latent":
             # Use VLM hidden size (not expert size) since prefix lives in VLM space
             hidden_dim = self.vlm_with_expert.config.text_config.hidden_size  # 576 for SmolVLM2-500M
-            self.laq_head = nn.Linear(
+            self.lam_head = nn.Linear(
                 hidden_dim,
-                config.laq_code_seq_len * config.laq_codebook_size  # 4 * 8 = 32
+                config.lam_code_seq_len * config.lam_codebook_size  # 4 * 8 = 32
             )
 
     def forward_latent(
@@ -100,11 +100,11 @@ class LatentSmolFlowMatching(VLAFlowMatching):
         lang_tokens: torch.Tensor,
         lang_masks: torch.Tensor,
         state: torch.Tensor,
-        laq_codes: torch.Tensor,  # [B, S] target codes
-        laq_valid_pair: torch.Tensor,  # [B] bool
+        lam_codes: torch.Tensor,  # [B, S] target codes
+        lam_valid_pair: torch.Tensor,  # [B] bool
     ) -> tuple[torch.Tensor, dict]:
         """
-        Mode A forward: predict LAQ codes from prefix only.
+        Mode A forward: predict LAM codes from prefix only.
         No action suffix / flow-matching involved.
         """
         # Get prefix embeddings (image + language + state)
@@ -132,16 +132,16 @@ class LatentSmolFlowMatching(VLAFlowMatching):
         pooled = _pool_hidden(prefix_out, prefix_pad_masks)  # [B, D]
 
         # Project to logits
-        logits = self.laq_head(pooled)  # [B, S*K]
-        logits = logits.view(-1, self.config.laq_code_seq_len, self.config.laq_codebook_size)  # [B, S, K]
+        logits = self.lam_head(pooled)  # [B, S*K]
+        logits = logits.view(-1, self.config.lam_code_seq_len, self.config.lam_codebook_size)  # [B, S, K]
 
         # CE loss (only on valid pairs)
-        valid_logits = logits[laq_valid_pair]  # [V, S, K]
-        valid_codes = laq_codes[laq_valid_pair]  # [V, S]
+        valid_logits = logits[lam_valid_pair]  # [V, S, K]
+        valid_codes = lam_codes[lam_valid_pair]  # [V, S]
 
         if valid_logits.numel() > 0:
             loss = F.cross_entropy(
-                valid_logits.reshape(-1, self.config.laq_codebook_size),
+                valid_logits.reshape(-1, self.config.lam_codebook_size),
                 valid_codes.reshape(-1)
             )
             preds = valid_logits.argmax(dim=-1)
@@ -157,35 +157,35 @@ class LatentSmolFlowMatching(VLAFlowMatching):
         else:
             loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
             accuracy = torch.tensor(0.0, device=logits.device)
-            per_pos_acc = torch.zeros(self.config.laq_code_seq_len, device=logits.device)
+            per_pos_acc = torch.zeros(self.config.lam_code_seq_len, device=logits.device)
             mean_confidence = torch.tensor(0.0, device=logits.device)
             preds = None
 
         loss_dict = {
-            "laq_loss": loss.item(),
-            "laq_accuracy": accuracy.item(),
-            "laq_valid_pairs": laq_valid_pair.sum().item(),
-            "laq_confidence": mean_confidence.item(),
+            "lam_loss": loss.item(),
+            "lam_accuracy": accuracy.item(),
+            "lam_valid_pairs": lam_valid_pair.sum().item(),
+            "lam_confidence": mean_confidence.item(),
         }
 
         # Add per-position accuracy
         for i, acc in enumerate(per_pos_acc.tolist()):
-            loss_dict[f"laq_acc_pos{i}"] = acc
+            loss_dict[f"lam_acc_pos{i}"] = acc
 
         # Store tensors for visualization (detached)
         loss_dict["_logits"] = logits.detach()  # [B, S, K]
-        loss_dict["_codes_gt"] = laq_codes.detach()  # [B, S]
+        loss_dict["_codes_gt"] = lam_codes.detach()  # [B, S]
         loss_dict["_codes_pred"] = preds.detach() if preds is not None else None  # [V, S]
-        loss_dict["_valid_mask"] = laq_valid_pair.detach()  # [B]
+        loss_dict["_valid_mask"] = lam_valid_pair.detach()  # [B]
 
-        return loss * self.config.laq_loss_weight, loss_dict
+        return loss * self.config.lam_loss_weight, loss_dict
 
 
 class LatentSmolPolicy(PreTrainedPolicy):
     """Wrapper class around LatentSmolFlowMatching to train and run inference within LeRobot.
 
     Supports two training modes:
-    - head_mode="latent": Train backbone on LAQ codes (Mode A)
+    - head_mode="latent": Train backbone on LAM codes (Mode A)
     - head_mode="action": Train action head with flow-matching (Mode B, same as SmolVLA)
     """
 
@@ -259,8 +259,8 @@ class LatentSmolPolicy(PreTrainedPolicy):
 
         return self.model.forward_latent(
             images, img_masks, lang_tokens, lang_masks, state,
-            laq_codes=batch["laq_codes"],
-            laq_valid_pair=batch["laq_valid_pair"],
+            lam_codes=batch["lam_codes"],
+            lam_valid_pair=batch["lam_valid_pair"],
         )
 
     def prepare_images_latent(self, batch: dict[str, Tensor]):

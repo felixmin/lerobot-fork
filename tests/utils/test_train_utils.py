@@ -88,7 +88,7 @@ def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     policy.config = Mock()
     policy.config.save_pretrained = Mock()
     cfg = Mock()
-    cfg.use_peft = True
+    cfg.peft = True
     save_checkpoint(tmp_path, 10, cfg, policy, optimizer)
     policy.save_pretrained.assert_called_once()
     cfg.save_pretrained.assert_called_once()

@@ -25,6 +25,11 @@ from lerobot.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
     MultiLeRobotDataset,
 )
+from lerobot.datasets.mixed_dataset import (
+    LogicalSource,
+    MixedLeRobotDataset,
+    load_dataset_mix_config,
+)
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
@@ -60,7 +65,9 @@ def resolve_delta_timestamps(
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            delta_timestamps[key] = [
+                i / ds_meta.fps for i in cfg.observation_delta_indices
+            ]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -68,7 +75,9 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+def make_dataset(
+    cfg: TrainPipelineConfig,
+) -> LeRobotDataset | MixedLeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -81,20 +90,72 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         LeRobotDataset | MultiLeRobotDataset
     """
     image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+        ImageTransforms(cfg.dataset.image_transforms)
+        if cfg.dataset.image_transforms.enable
+        else None
     )
 
-    if isinstance(cfg.dataset.repo_id, str):
+    if cfg.dataset.mix_path is not None:
+        if cfg.dataset.streaming:
+            raise ValueError("Mixed datasets do not support streaming mode.")
+
+        mix_cfg = load_dataset_mix_config(cfg.dataset.mix_path)
+        sources = []
+        shared_dataset_cache = {}
+        for source_index, source_cfg in enumerate(mix_cfg.sources):
+            source_meta = LeRobotDatasetMetadata(
+                source_cfg.repo_id,
+                root=source_cfg.root,
+                revision=source_cfg.revision,
+            )
+
+            if (
+                getattr(cfg.policy, "type", None) == "latent_smol"
+                and getattr(cfg.policy, "head_mode", None) == "latent"
+                and getattr(cfg.policy, "lam_future_frames", 0) <= 0
+            ):
+                cfg.policy.lam_future_frames = max(
+                    1, round(source_meta.fps * cfg.policy.lam_future_seconds)
+                )
+                logging.info(
+                    f"Computed lam_future_frames={cfg.policy.lam_future_frames} (fps={source_meta.fps})"
+                )
+
+            source_delta_timestamps = resolve_delta_timestamps(cfg.policy, source_meta)
+            sources.append(
+                LogicalSource(
+                    source_index=source_index,
+                    config=source_cfg,
+                    meta=source_meta,
+                    delta_timestamps=source_delta_timestamps,
+                    image_transforms=image_transforms,
+                    default_tolerance_s=cfg.tolerance_s,
+                    shared_dataset_cache=shared_dataset_cache,
+                )
+            )
+
+        dataset = MixedLeRobotDataset(
+            logical_repo_id=cfg.dataset.repo_id,
+            mix_path=mix_cfg.path,
+            sources=sources,
+        )
+    elif isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
 
-        # Compute laq_future_frames for latent_smol in latent mode before resolving delta timestamps
-        if (getattr(cfg.policy, 'type', None) == "latent_smol" and
-            getattr(cfg.policy, 'head_mode', None) == "latent" and
-            getattr(cfg.policy, 'laq_future_frames', 0) <= 0):
-            cfg.policy.laq_future_frames = max(1, round(ds_meta.fps * cfg.policy.laq_future_seconds))
-            logging.info(f"Computed laq_future_frames={cfg.policy.laq_future_frames} (fps={ds_meta.fps})")
+        # Compute lam_future_frames for latent_smol in latent mode before resolving delta timestamps
+        if (
+            getattr(cfg.policy, "type", None) == "latent_smol"
+            and getattr(cfg.policy, "head_mode", None) == "latent"
+            and getattr(cfg.policy, "lam_future_frames", 0) <= 0
+        ):
+            cfg.policy.lam_future_frames = max(
+                1, round(ds_meta.fps * cfg.policy.lam_future_seconds)
+            )
+            logging.info(
+                f"Computed lam_future_frames={cfg.policy.lam_future_frames} (fps={ds_meta.fps})"
+            )
 
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
@@ -136,6 +197,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                dataset.meta.stats[key][stats_type] = torch.tensor(
+                    stats, dtype=torch.float32
+                )
 
     return dataset

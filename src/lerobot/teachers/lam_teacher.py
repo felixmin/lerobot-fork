@@ -14,12 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LAQ teacher adapter for LeRobot training.
+"""LAM teacher adapter for LeRobot training.
 
-This module provides an adapter for using HLRP LAQ (Latent Action Quantization)
+This module provides an adapter for using HLRP LAM (Latent Action Quantization)
 models as teachers for online label generation during training.
 
-The LAQ teacher generates discrete latent codes from frame pairs (frame_t, frame_{t+delta}),
+The LAM teacher generates discrete latent codes from frame pairs (frame_t, frame_{t+delta}),
 which can be used as targets for pretraining vision-language models.
 """
 
@@ -30,11 +30,11 @@ import torch.nn as nn
 
 
 @dataclass
-class LAQTeacherConfig:
-    """Configuration for LAQ teacher.
+class LAMTeacherConfig:
+    """Configuration for LAM teacher.
 
     Args:
-        checkpoint_path: Path to the LAQ model checkpoint.
+        checkpoint_path: Path to the LAM model checkpoint.
         device: Device to load the model on (e.g., "cuda", "cpu").
     """
 
@@ -42,31 +42,31 @@ class LAQTeacherConfig:
     device: str = "cuda"
 
 
-class LAQTeacher(nn.Module):
-    """Frozen LAQ teacher for online label generation.
+class LAMTeacher(nn.Module):
+    """Frozen LAM teacher for online label generation.
 
-    This class wraps an HLRP LAQ model to generate latent codes from frame pairs.
+    This class wraps an HLRP LAM model to generate latent codes from frame pairs.
     The teacher is kept frozen during training and used only for generating targets.
 
     Args:
-        config: LAQTeacherConfig with checkpoint path and device.
+        config: LAMTeacherConfig with checkpoint path and device.
     """
 
-    def __init__(self, config: LAQTeacherConfig):
+    def __init__(self, config: LAMTeacherConfig):
         super().__init__()
 
         # Import from HLRP
-        from foundation.online_laq import LAQTaskCodeProvider
-        from laq.task import LAQTask
+        from stage2.online_lam import LAMTaskCodeProvider
+        from lam.task import LAMTask
 
-        # Use weights_only=False for LAQ checkpoints (trusted source)
+        # Use weights_only=False for LAM checkpoints (trusted source)
         # Required for PyTorch 2.6+ which changed the default
-        laq_task = LAQTask.load_from_checkpoint(
+        lam_task = LAMTask.load_from_checkpoint(
             config.checkpoint_path,
             map_location=config.device,
             weights_only=False,
         )
-        self.provider = LAQTaskCodeProvider(laq_task)
+        self.provider = LAMTaskCodeProvider(lam_task)
         self.provider.to(config.device)
 
         # Freeze all parameters
@@ -75,7 +75,7 @@ class LAQTeacher(nn.Module):
 
     @property
     def codebook_size(self) -> int:
-        """Size of the LAQ codebook (K)."""
+        """Size of the LAM codebook (K)."""
         return self.provider.codebook_size
 
     @property
@@ -85,7 +85,7 @@ class LAQTeacher(nn.Module):
 
     @torch.no_grad()
     def codes_from_pair(self, frames: torch.Tensor) -> torch.Tensor:
-        """Generate LAQ codes from a frame pair.
+        """Generate LAM codes from a frame pair.
 
         Args:
             frames: Frame pair tensor of shape [B, 2, 3, H, W] with float values in [0, 1].

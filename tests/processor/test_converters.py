@@ -307,3 +307,33 @@ def test_transition_to_batch_without_index_fields():
     assert "task" in batch
     assert "index" not in batch
     assert "task_index" not in batch
+
+
+def test_batch_to_transition_preserves_stage3_mix_metadata():
+    batch = {
+        OBS_STATE: torch.randn(1, 7),
+        ACTION: torch.randn(1, 4),
+        "hlrp_action_supervised": torch.tensor([True]),
+        "hlrp_latent_supervised": torch.tensor([False]),
+        "hlrp_source_name": ["latent_source"],
+        "dataset_source_name": ["latent_source"],
+    }
+
+    transition = batch_to_transition(batch)
+    comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert torch.equal(comp_data["hlrp_action_supervised"], batch["hlrp_action_supervised"])
+    assert torch.equal(comp_data["hlrp_latent_supervised"], batch["hlrp_latent_supervised"])
+    assert comp_data["hlrp_source_name"] == batch["hlrp_source_name"]
+    assert comp_data["dataset_source_name"] == batch["dataset_source_name"]
+
+    reconstructed = transition_to_batch(transition)
+
+    assert torch.equal(
+        reconstructed["hlrp_action_supervised"], batch["hlrp_action_supervised"]
+    )
+    assert torch.equal(
+        reconstructed["hlrp_latent_supervised"], batch["hlrp_latent_supervised"]
+    )
+    assert reconstructed["hlrp_source_name"] == batch["hlrp_source_name"]
+    assert reconstructed["dataset_source_name"] == batch["dataset_source_name"]

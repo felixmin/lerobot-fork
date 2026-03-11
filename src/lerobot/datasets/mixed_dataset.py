@@ -1,0 +1,801 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+
+from lerobot.datasets.compute_stats import aggregate_stats
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.sampler import WeightedSourceSampler
+from lerobot.datasets.utils import flatten_dict, unflatten_dict
+
+VALID_SUPERVISION_MODES = {"latent_only", "multitask"}
+logger = logging.getLogger(__name__)
+
+
+def _debug_mixed_dataset() -> bool:
+    value = os.environ.get("HLRP_STAGE3_DEBUG_DATASET", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class DatasetMixSourceConfig:
+    name: str
+    repo_id: str
+    root: str | None = None
+    revision: str | None = None
+    weight: float = 1.0
+    episodes: tuple[int, ...] | None = None
+    exclude_episodes: tuple[int, ...] | None = None
+    supervision: str = "multitask"
+    video_backend: str | None = None
+    tolerance_s: float | None = None
+
+
+@dataclass(frozen=True)
+class DatasetMixConfig:
+    path: Path
+    sources: tuple[DatasetMixSourceConfig, ...]
+
+
+@dataclass(frozen=True)
+class SourceIndex:
+    episode_indices: np.ndarray
+    dataset_from_index: np.ndarray
+    dataset_to_index: np.ndarray
+    lengths: np.ndarray
+    cumulative_lengths: np.ndarray
+
+
+@dataclass(frozen=True)
+class MixedSourceMetadata:
+    name: str
+    repo_id: str
+    root: str | None
+    revision: str | None
+    weight: float
+    supervision: str
+    episodes: tuple[int, ...]
+    video_backend: str | None
+    tolerance_s: float
+    num_frames: int
+
+
+@dataclass
+class MixedLeRobotDatasetMetadata:
+    repo_id: str
+    mix_path: str
+    fps: int
+    features: dict[str, dict[str, Any]]
+    stats: dict[str, dict[str, np.ndarray]]
+    episodes: pd.DataFrame
+    source_metadata: tuple[MixedSourceMetadata, ...]
+    info: dict[str, Any]
+
+    @property
+    def camera_keys(self) -> list[str]:
+        return [
+            key
+            for key, feature in self.features.items()
+            if feature["dtype"] in {"image", "video"}
+        ]
+
+    @property
+    def total_frames(self) -> int:
+        return int(self.info["total_frames"])
+
+    @property
+    def total_episodes(self) -> int:
+        return int(self.info["total_episodes"])
+
+
+def _parse_episode_list(
+    *,
+    field_name: str,
+    values: list[int] | None,
+    total_episodes: int | None = None,
+) -> tuple[int, ...] | None:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise TypeError(f"Expected '{field_name}' to be a list of integers.")
+    if any(not isinstance(value, int) for value in values):
+        raise TypeError(f"Expected '{field_name}' to contain only integers.")
+    if len(set(values)) != len(values):
+        raise ValueError(f"Expected '{field_name}' to contain unique episode indices.")
+    if total_episodes is not None and any(
+        value < 0 or value >= total_episodes for value in values
+    ):
+        raise ValueError(
+            f"Episode indices in '{field_name}' are out of range for dataset with {total_episodes} episodes."
+        )
+    return tuple(sorted(values))
+
+
+def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
+    mix_path = Path(path).expanduser().resolve()
+    payload = yaml.safe_load(mix_path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected mix config '{mix_path}' to contain a mapping.")
+
+    raw_sources = payload.get("sources")
+    if not isinstance(raw_sources, list) or len(raw_sources) == 0:
+        raise ValueError(
+            f"Expected mix config '{mix_path}' to contain a non-empty 'sources' list."
+        )
+
+    sources = []
+    seen_names = set()
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict):
+            raise TypeError("Each mix source must be a mapping.")
+        if (
+            raw_source.get("episodes") is not None
+            and raw_source.get("exclude_episodes") is not None
+        ):
+            raise ValueError(
+                "A mix source cannot define both 'episodes' and 'exclude_episodes'."
+            )
+
+        source = DatasetMixSourceConfig(
+            name=str(raw_source["name"]),
+            repo_id=str(raw_source["repo_id"]),
+            root=None if raw_source.get("root") is None else str(raw_source["root"]),
+            revision=(
+                None
+                if raw_source.get("revision") is None
+                else str(raw_source["revision"])
+            ),
+            weight=float(raw_source["weight"]),
+            episodes=_parse_episode_list(
+                field_name="episodes", values=raw_source.get("episodes")
+            ),
+            exclude_episodes=_parse_episode_list(
+                field_name="exclude_episodes", values=raw_source.get("exclude_episodes")
+            ),
+            supervision=str(raw_source["supervision"]),
+            video_backend=(
+                None
+                if raw_source.get("video_backend") is None
+                else str(raw_source["video_backend"])
+            ),
+            tolerance_s=(
+                None
+                if raw_source.get("tolerance_s") is None
+                else float(raw_source["tolerance_s"])
+            ),
+        )
+        if source.name in seen_names:
+            raise ValueError(f"Duplicate mix source name '{source.name}'.")
+        if source.weight <= 0:
+            raise ValueError(f"Mix source '{source.name}' must have a positive weight.")
+        if source.supervision not in VALID_SUPERVISION_MODES:
+            raise ValueError(
+                f"Mix source '{source.name}' has invalid supervision '{source.supervision}'. "
+                f"Expected one of {sorted(VALID_SUPERVISION_MODES)}."
+            )
+
+        seen_names.add(source.name)
+        sources.append(source)
+
+    return DatasetMixConfig(path=mix_path, sources=tuple(sources))
+
+
+def _selected_episodes(
+    source: DatasetMixSourceConfig, total_episodes: int
+) -> tuple[int, ...]:
+    episodes = _parse_episode_list(
+        field_name=f"{source.name}.episodes",
+        values=list(source.episodes) if source.episodes is not None else None,
+        total_episodes=total_episodes,
+    )
+    exclude_episodes = _parse_episode_list(
+        field_name=f"{source.name}.exclude_episodes",
+        values=(
+            list(source.exclude_episodes)
+            if source.exclude_episodes is not None
+            else None
+        ),
+        total_episodes=total_episodes,
+    )
+    if episodes is not None and exclude_episodes is not None:
+        raise ValueError(
+            f"Mix source '{source.name}' cannot define both 'episodes' and 'exclude_episodes'."
+        )
+    if episodes is not None:
+        return episodes
+    excluded = set(exclude_episodes or ())
+    selected = tuple(
+        episode for episode in range(total_episodes) if episode not in excluded
+    )
+    if len(selected) == 0:
+        raise ValueError(f"Mix source '{source.name}' does not select any episodes.")
+    return selected
+
+
+def _build_source_index(
+    meta: LeRobotDatasetMetadata, selected_episodes: tuple[int, ...]
+) -> SourceIndex:
+    starts = []
+    stops = []
+    for episode_index in selected_episodes:
+        episode = meta.episodes[int(episode_index)]
+        starts.append(int(episode["dataset_from_index"]))
+        stops.append(int(episode["dataset_to_index"]))
+
+    starts_np = np.asarray(starts, dtype=np.int64)
+    stops_np = np.asarray(stops, dtype=np.int64)
+    lengths = stops_np - starts_np
+    if len(lengths) == 0 or np.any(lengths <= 0):
+        raise ValueError("Mix sources must resolve to non-empty episodes.")
+
+    return SourceIndex(
+        episode_indices=np.asarray(selected_episodes, dtype=np.int64),
+        dataset_from_index=starts_np,
+        dataset_to_index=stops_np,
+        lengths=lengths,
+        cumulative_lengths=np.cumsum(lengths, dtype=np.int64),
+    )
+
+
+def _episode_stats(
+    meta: LeRobotDatasetMetadata, episode_index: int
+) -> dict[str, dict[str, np.ndarray]]:
+    episode = meta.episodes[int(episode_index)]
+    flat_stats = {}
+    for key, value in episode.items():
+        if key.startswith("stats/"):
+            flat_stats[key[len("stats/") :]] = np.asarray(value)
+    return unflatten_dict(flat_stats)
+
+
+def _aggregate_selected_stats(
+    meta: LeRobotDatasetMetadata, selected_episodes: tuple[int, ...]
+) -> dict[str, dict[str, np.ndarray]]:
+    return aggregate_stats(
+        [_episode_stats(meta, episode_index) for episode_index in selected_episodes]
+    )
+
+
+def _stats_signature(
+    stats: dict[str, dict[str, np.ndarray]],
+) -> dict[str, tuple[int, ...]]:
+    return {
+        key: tuple(np.asarray(value).shape)
+        for key, value in flatten_dict(stats).items()
+    }
+
+
+def _normalize_weights(weights: np.ndarray) -> np.ndarray:
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.ndim != 1:
+        raise ValueError(f"Expected 1D source weights, got shape {tuple(weights.shape)}")
+    if weights.size == 0:
+        raise ValueError("Expected at least one source weight")
+    if np.any(weights < 0):
+        raise ValueError("Source weights must be non-negative")
+    total = float(weights.sum())
+    if total <= 0.0:
+        raise ValueError("Source weights must sum to a positive value")
+    return weights / total
+
+
+def _to_flat_array(value: np.ndarray | Any, *, dtype: np.dtype) -> np.ndarray:
+    out = np.asarray(value, dtype=dtype)
+    if out.ndim == 0:
+        return out.reshape(1)
+    return out.reshape(-1)
+
+
+def _pad_last_dim(
+    array: np.ndarray, *, target_dim: int, fill_value: float
+) -> tuple[np.ndarray, np.ndarray]:
+    if array.ndim != 1:
+        raise ValueError(f"Expected 1D stats array, got shape {tuple(array.shape)}")
+    if int(array.shape[0]) > int(target_dim):
+        raise ValueError(
+            f"Stats dim {int(array.shape[0])} exceeds target_dim {int(target_dim)}"
+        )
+    padded = np.full((int(target_dim),), fill_value, dtype=array.dtype)
+    valid = np.zeros((int(target_dim),), dtype=np.bool_)
+    padded[: int(array.shape[0])] = array
+    valid[: int(array.shape[0])] = True
+    return padded, valid
+
+
+def merge_weighted_stats(
+    stats_by_source: list[dict[str, dict[str, np.ndarray]]],
+    source_weights: np.ndarray,
+) -> dict[str, dict[str, np.ndarray]]:
+    if not stats_by_source:
+        return {}
+    if len(stats_by_source) != int(source_weights.shape[0]):
+        raise ValueError("stats_by_source and source_weights length mismatch")
+
+    weights = _normalize_weights(np.asarray(source_weights, dtype=np.float64))
+    merged: dict[str, dict[str, np.ndarray]] = {}
+    feature_keys = {key for stats in stats_by_source for key in stats}
+    for feature_key in feature_keys:
+        present = [
+            (stats[feature_key], weights[idx])
+            for idx, stats in enumerate(stats_by_source)
+            if feature_key in stats
+        ]
+        if not present:
+            continue
+
+        local_weights = np.asarray([weight for _, weight in present], dtype=np.float64)
+        means = [
+            _to_flat_array(entry["mean"], dtype=np.float64) for entry, _ in present
+        ]
+        stds = [_to_flat_array(entry["std"], dtype=np.float64) for entry, _ in present]
+        mins = [_to_flat_array(entry["min"], dtype=np.float64) for entry, _ in present]
+        maxs = [_to_flat_array(entry["max"], dtype=np.float64) for entry, _ in present]
+        counts = [
+            _to_flat_array(
+                entry.get("count", np.asarray([0], dtype=np.int64)), dtype=np.int64
+            )
+            for entry, _ in present
+        ]
+        feature_dim = max(int(arr.shape[0]) for arr in means)
+
+        mean_arrays: list[np.ndarray] = []
+        std_arrays: list[np.ndarray] = []
+        min_arrays: list[np.ndarray] = []
+        max_arrays: list[np.ndarray] = []
+        valid_masks: list[np.ndarray] = []
+        for mu, sigma, min_value, max_value in zip(
+            means, stds, mins, maxs, strict=True
+        ):
+            mu_pad, valid = _pad_last_dim(mu, target_dim=feature_dim, fill_value=0.0)
+            sigma_pad, _ = _pad_last_dim(sigma, target_dim=feature_dim, fill_value=0.0)
+            min_pad, _ = _pad_last_dim(
+                min_value, target_dim=feature_dim, fill_value=np.inf
+            )
+            max_pad, _ = _pad_last_dim(
+                max_value, target_dim=feature_dim, fill_value=-np.inf
+            )
+            mean_arrays.append(mu_pad)
+            std_arrays.append(sigma_pad)
+            min_arrays.append(min_pad)
+            max_arrays.append(max_pad)
+            valid_masks.append(valid)
+
+        valid_matrix = np.stack(valid_masks, axis=0)
+        weight_matrix = valid_matrix.astype(np.float64) * local_weights[:, None]
+        denom = weight_matrix.sum(axis=0)
+        if np.any(denom <= 0.0):
+            raise ValueError(
+                f"Feature {feature_key!r} has no valid stats coverage on some dimensions"
+            )
+        normalized_weight_matrix = weight_matrix / denom[None, :]
+
+        mean = np.zeros((feature_dim,), dtype=np.float64)
+        for weight_row, mu in zip(normalized_weight_matrix, mean_arrays, strict=True):
+            mean = mean + (weight_row * mu)
+
+        variance = np.zeros((feature_dim,), dtype=np.float64)
+        for weight_row, mu, sigma in zip(
+            normalized_weight_matrix, mean_arrays, std_arrays, strict=True
+        ):
+            variance = variance + (weight_row * ((sigma**2) + ((mu - mean) ** 2)))
+
+        feature_stats: dict[str, np.ndarray] = {
+            "mean": mean,
+            "std": np.sqrt(variance),
+            "min": np.minimum.reduce(np.stack(min_arrays, axis=0)),
+            "max": np.maximum.reduce(np.stack(max_arrays, axis=0)),
+        }
+        if all(int(count.shape[0]) == 1 for count in counts):
+            feature_stats["count"] = np.asarray(
+                [sum(int(count[0]) for count in counts)],
+                dtype=np.int64,
+            )
+        else:
+            count_arrays = [
+                _pad_last_dim(
+                    count.astype(np.int64), target_dim=feature_dim, fill_value=0
+                )[0]
+                for count in counts
+            ]
+            feature_stats["count"] = np.sum(np.stack(count_arrays, axis=0), axis=0)
+
+        quantile_keys = {
+            stat_key
+            for entry, _ in present
+            for stat_key in entry
+            if stat_key.startswith("q") and stat_key[1:].isdigit()
+        }
+        for quantile_key in quantile_keys:
+            if all(quantile_key in entry for entry, _ in present):
+                values = [
+                    _pad_last_dim(
+                        _to_flat_array(entry[quantile_key], dtype=np.float64),
+                        target_dim=feature_dim,
+                        fill_value=0.0,
+                    )[0]
+                    for entry, _ in present
+                ]
+                q_value = np.zeros((feature_dim,), dtype=np.float64)
+                for weight_row, value in zip(
+                    normalized_weight_matrix, values, strict=True
+                ):
+                    q_value = q_value + (weight_row * value)
+                feature_stats[quantile_key] = q_value
+
+        merged[feature_key] = feature_stats
+    return merged
+
+
+def build_explicit_mixed_stats(sources: list[Any]) -> dict[str, dict[str, np.ndarray]]:
+    stats_by_source = []
+    for source in sources:
+        stats = getattr(source, "stats", None)
+        if stats is None:
+            stats = getattr(getattr(source, "meta", None), "stats", None)
+        if stats is None:
+            raise ValueError("Each mixed source must expose stats directly or via source.meta.stats")
+        stats_by_source.append(deepcopy(stats))
+    source_weights = np.asarray(
+        [float(source.weight) for source in sources], dtype=np.float64
+    )
+    return merge_weighted_stats(stats_by_source, source_weights)
+
+
+class LogicalSource:
+    def __init__(
+        self,
+        *,
+        source_index: int,
+        config: DatasetMixSourceConfig,
+        meta: LeRobotDatasetMetadata,
+        delta_timestamps: dict[str, list[float]] | None,
+        image_transforms: Any = None,
+        default_tolerance_s: float = 1e-4,
+        shared_dataset_cache: dict[tuple[Any, ...], LeRobotDataset] | None = None,
+    ) -> None:
+        self.source_index = int(source_index)
+        self.config = config
+        self.meta = meta
+        self.delta_timestamps = deepcopy(delta_timestamps)
+        self.image_transforms = image_transforms
+        self.selected_episodes = _selected_episodes(config, meta.total_episodes)
+        self.index = _build_source_index(meta, self.selected_episodes)
+        self.features = deepcopy(meta.features)
+        self.stats = _aggregate_selected_stats(meta, self.selected_episodes)
+        self.tolerance_s = float(
+            default_tolerance_s if config.tolerance_s is None else config.tolerance_s
+        )
+        self._shared_dataset_cache = (
+            {} if shared_dataset_cache is None else shared_dataset_cache
+        )
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+    @property
+    def repo_id(self) -> str:
+        return self.config.repo_id
+
+    @property
+    def root(self) -> str | None:
+        return self.config.root
+
+    @property
+    def revision(self) -> str | None:
+        return self.config.revision
+
+    @property
+    def weight(self) -> float:
+        return self.config.weight
+
+    @property
+    def supervision(self) -> str:
+        return self.config.supervision
+
+    @property
+    def num_frames(self) -> int:
+        return int(self.index.lengths.sum())
+
+    @property
+    def num_episodes(self) -> int:
+        return int(len(self.selected_episodes))
+
+    @property
+    def camera_keys(self) -> list[str]:
+        return [
+            key
+            for key, feature in self.features.items()
+            if feature["dtype"] in {"image", "video"}
+        ]
+
+    @property
+    def action_supervised(self) -> bool:
+        return self.supervision == "multitask"
+
+    @property
+    def latent_supervised(self) -> bool:
+        return True
+
+    @property
+    def dataset_identity(self) -> tuple[str, str | None, str | None]:
+        return (self.repo_id, str(Path(self.meta.root).resolve()), self.revision)
+
+    def get_effective_lengths(self, drop_n_last_frames: int = 0) -> np.ndarray:
+        return np.maximum(self.index.lengths - int(drop_n_last_frames), 0)
+
+    def flat_index_to_anchor(self, index: int, *, drop_n_last_frames: int = 0) -> int:
+        effective_lengths = self.get_effective_lengths(drop_n_last_frames)
+        total_effective = int(effective_lengths.sum())
+        if index < 0 or index >= total_effective:
+            raise IndexError(f"Index {index} out of bounds for source '{self.name}'.")
+
+        cumulative_lengths = np.cumsum(effective_lengths, dtype=np.int64)
+        episode_pos = int(np.searchsorted(cumulative_lengths, index, side="right"))
+        prev_total = 0 if episode_pos == 0 else int(cumulative_lengths[episode_pos - 1])
+        return int(self.index.dataset_from_index[episode_pos] + (index - prev_total))
+
+    def metadata(self) -> MixedSourceMetadata:
+        return MixedSourceMetadata(
+            name=self.name,
+            repo_id=self.repo_id,
+            root=self.root,
+            revision=self.revision,
+            weight=self.weight,
+            supervision=self.supervision,
+            episodes=self.selected_episodes,
+            video_backend=self.config.video_backend,
+            tolerance_s=self.tolerance_s,
+            num_frames=self.num_frames,
+        )
+
+    def _get_dataset(self) -> LeRobotDataset:
+        cache_key = (
+            self.repo_id,
+            str(Path(self.meta.root).resolve()),
+            self.revision,
+            self.config.video_backend,
+            float(self.tolerance_s),
+            repr(self.delta_timestamps),
+            id(self.image_transforms),
+        )
+        dataset = self._shared_dataset_cache.get(cache_key)
+        if dataset is None:
+            dataset = LeRobotDataset(
+                self.repo_id,
+                root=self.meta.root,
+                episodes=None,
+                image_transforms=self.image_transforms,
+                delta_timestamps=self.delta_timestamps,
+                revision=self.revision,
+                video_backend=self.config.video_backend,
+                tolerance_s=self.tolerance_s,
+            )
+            self._shared_dataset_cache[cache_key] = dataset
+        return dataset
+
+    def get_item(self, anchor_abs_index: int) -> dict[str, Any]:
+        dataset = self._get_dataset()
+        if dataset._absolute_to_relative_idx is None:
+            relative_index = int(anchor_abs_index)
+        else:
+            relative_index = int(
+                dataset._absolute_to_relative_idx[int(anchor_abs_index)]
+            )
+        if _debug_mixed_dataset():
+            logger.info(
+                "[mixed] source=%s supervision=%s anchor_abs=%s relative=%s",
+                self.name,
+                self.supervision,
+                int(anchor_abs_index),
+                int(relative_index),
+            )
+
+        item = dataset[relative_index]
+        item["hlrp_action_supervised"] = torch.tensor(
+            self.action_supervised, dtype=torch.bool
+        )
+        item["hlrp_latent_supervised"] = torch.tensor(
+            self.latent_supervised, dtype=torch.bool
+        )
+        item["hlrp_source_name"] = self.name
+        item["dataset_source_index"] = torch.tensor(
+            self.source_index, dtype=torch.int64
+        )
+        item["dataset_source_name"] = self.name
+        item["dataset_source_repo_id"] = self.repo_id
+        item["dataset_source_root"] = "" if self.root is None else self.root
+        item["dataset_source_revision"] = "" if self.revision is None else self.revision
+        return item
+
+
+def _build_virtual_episodes(sources: list[LogicalSource]) -> pd.DataFrame:
+    rows = []
+    cursor = 0
+    logical_episode_index = 0
+    for source in sources:
+        for source_episode_index, length in zip(
+            source.selected_episodes, source.index.lengths, strict=True
+        ):
+            rows.append(
+                {
+                    "episode_index": logical_episode_index,
+                    "dataset_from_index": cursor,
+                    "dataset_to_index": cursor + int(length),
+                    "source_name": source.name,
+                    "source_repo_id": source.repo_id,
+                    "source_episode_index": int(source_episode_index),
+                }
+            )
+            cursor += int(length)
+            logical_episode_index += 1
+    return pd.DataFrame(rows)
+
+
+def _build_mixed_info(
+    logical_repo_id: str,
+    mix_path: Path,
+    sources: list[LogicalSource],
+) -> dict[str, Any]:
+    info = deepcopy(sources[0].meta.info)
+    info["total_episodes"] = int(sum(source.num_episodes for source in sources))
+    info["total_frames"] = int(sum(source.num_frames for source in sources))
+    info["mixed_sources"] = [
+        {
+            "name": metadata.name,
+            "repo_id": metadata.repo_id,
+            "root": metadata.root,
+            "revision": metadata.revision,
+            "weight": metadata.weight,
+            "supervision": metadata.supervision,
+            "episodes": list(metadata.episodes),
+            "video_backend": metadata.video_backend,
+            "tolerance_s": metadata.tolerance_s,
+            "num_frames": metadata.num_frames,
+        }
+        for metadata in (source.metadata() for source in sources)
+    ]
+    info["mix_path"] = str(mix_path)
+    info["logical_repo_id"] = logical_repo_id
+    return info
+
+
+def validate_mixed_sources(sources: list[LogicalSource]) -> None:
+    if len(sources) == 0:
+        raise ValueError("Expected at least one logical source.")
+
+    base_source = sources[0]
+    base_features = base_source.features
+    base_fps = base_source.meta.fps
+    base_delta_timestamps = base_source.delta_timestamps
+    base_camera_keys = base_source.camera_keys
+    base_stats_signature = _stats_signature(base_source.stats)
+
+    seen_episodes: dict[tuple[str, str | None, str | None], set[int]] = {}
+    for source in sources:
+        if source.num_frames <= 0:
+            raise ValueError(f"Mix source '{source.name}' resolved to zero frames.")
+        if source.meta.fps != base_fps:
+            raise ValueError("All mix sources must have matching fps.")
+        if source.features != base_features:
+            raise ValueError("All mix sources must have identical feature schemas.")
+        if source.camera_keys != base_camera_keys:
+            raise ValueError("All mix sources must expose the same camera keys.")
+        if source.delta_timestamps != base_delta_timestamps:
+            raise ValueError(
+                "All mix sources must resolve to identical delta timestamps."
+            )
+        if _stats_signature(source.stats) != base_stats_signature:
+            raise ValueError(
+                "All mix sources must expose compatible normalization-stat schemas."
+            )
+
+        seen = seen_episodes.setdefault(source.dataset_identity, set())
+        overlap = seen.intersection(source.selected_episodes)
+        if overlap:
+            overlap_text = ", ".join(str(episode) for episode in sorted(overlap))
+            raise ValueError(
+                f"Mix sources cannot overlap on the same physical dataset. "
+                f"Source '{source.name}' overlaps on episodes [{overlap_text}]."
+            )
+        seen.update(source.selected_episodes)
+
+
+class MixedLeRobotDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        *,
+        logical_repo_id: str,
+        mix_path: str | Path,
+        sources: list[LogicalSource],
+    ) -> None:
+        super().__init__()
+        validate_mixed_sources(sources)
+        self.repo_id = logical_repo_id
+        self.mix_path = str(Path(mix_path).expanduser().resolve())
+        self.sources = list(sources)
+        self.source_weights = np.asarray(
+            [source.weight for source in self.sources], dtype=np.float64
+        )
+        self.episodes = None
+        self._cumulative_frames = np.cumsum(
+            [source.num_frames for source in self.sources], dtype=np.int64
+        )
+
+        self.meta = MixedLeRobotDatasetMetadata(
+            repo_id=self.repo_id,
+            mix_path=self.mix_path,
+            fps=int(self.sources[0].meta.fps),
+            features=deepcopy(self.sources[0].features),
+            stats=build_explicit_mixed_stats(self.sources),
+            episodes=_build_virtual_episodes(self.sources),
+            source_metadata=tuple(source.metadata() for source in self.sources),
+            info=_build_mixed_info(self.repo_id, Path(self.mix_path), self.sources),
+        )
+
+    @property
+    def num_frames(self) -> int:
+        return (
+            0 if len(self._cumulative_frames) == 0 else int(self._cumulative_frames[-1])
+        )
+
+    @property
+    def num_episodes(self) -> int:
+        return int(sum(source.num_episodes for source in self.sources))
+
+    @property
+    def features(self) -> dict[str, dict[str, Any]]:
+        return self.meta.features
+
+    def __len__(self) -> int:
+        return self.num_frames
+
+    def __getitem__(self, index: int | tuple[int, int]) -> dict[str, Any]:
+        if isinstance(index, tuple):
+            source_index, anchor_abs_index = index
+            return self.sources[int(source_index)].get_item(int(anchor_abs_index))
+
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Index {index} out of bounds.")
+
+        source_index = int(
+            np.searchsorted(self._cumulative_frames, int(index), side="right")
+        )
+        previous_total = (
+            0 if source_index == 0 else int(self._cumulative_frames[source_index - 1])
+        )
+        logical_index = int(index) - previous_total
+        anchor_abs_index = self.sources[source_index].flat_index_to_anchor(
+            logical_index
+        )
+        return self.sources[source_index].get_item(anchor_abs_index)
+
+    def build_sampler(
+        self, *, seed: int | None = None, drop_n_last_frames: int = 0
+    ) -> WeightedSourceSampler:
+        num_samples = int(
+            sum(
+                source.get_effective_lengths(drop_n_last_frames).sum()
+                for source in self.sources
+            )
+        )
+        if num_samples <= 0:
+            raise ValueError(
+                "Mix dataset has no effective samples after drop_n_last_frames."
+            )
+        return WeightedSourceSampler(
+            sources=self.sources,
+            source_weights=self.source_weights,
+            num_samples=num_samples,
+            seed=0 if seed is None else int(seed),
+            drop_n_last_frames=drop_n_last_frames,
+        )

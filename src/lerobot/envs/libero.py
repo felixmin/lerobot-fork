@@ -26,6 +26,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+import libero.libero as libero_core
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
@@ -80,6 +81,22 @@ def get_task_init_states(task_suite: Any, i: int) -> np.ndarray:
 def get_libero_dummy_action():
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
+
+
+def _pin_assets_path_from_libero_config() -> None:
+    assets_dir = Path(get_libero_path("assets"))
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    required_subdirs = (
+        "articulated_objects",
+        "stable_scanned_objects",
+        "turbosquid_objects",
+        "stable_hope_objects",
+    )
+    if not all((assets_dir / name).exists() for name in required_subdirs):
+        from libero.libero.utils.download_utils import download_assets_from_huggingface
+
+        download_assets_from_huggingface(download_dir=str(assets_dir))
+    libero_core._assets_path_cache = str(assets_dir)
 
 
 ACTION_DIM = 7
@@ -147,6 +164,7 @@ class LiberoEnv(gym.Env):
         self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
         self._init_state_id = self.episode_index  # tie each sub-env to a fixed init state
 
+        _pin_assets_path_from_libero_config()
         self._env = self._make_envs_task(task_suite, self.task_id)
         default_steps = 500
         self._max_episode_steps = (

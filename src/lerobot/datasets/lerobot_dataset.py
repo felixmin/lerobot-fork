@@ -16,6 +16,7 @@
 import concurrent.futures
 import contextlib
 import logging
+import os
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -77,6 +78,13 @@ from lerobot.datasets.video_utils import (
     get_video_info,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+logger = logging.getLogger(__name__)
+
+
+def _debug_dataset_item() -> bool:
+    value = os.environ.get("HLRP_STAGE3_DEBUG_DATASET", "")
+    return value.lower() in {"1", "true", "yes", "on"}
 
 CODEBASE_VERSION = "v3.0"
 VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1"}
@@ -1030,6 +1038,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+            if _debug_dataset_item():
+                logger.info(
+                    "[dataset] ep=%s vid_key=%s backend=%s from_ts=%.3f query_ts=%s video=%s",
+                    int(ep_idx),
+                    vid_key,
+                    self.video_backend,
+                    float(from_timestamp),
+                    [round(float(ts), 3) for ts in shifted_query_ts],
+                    video_path,
+                )
             frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
             item[vid_key] = frames.squeeze(0)
 
@@ -1055,6 +1073,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ep_idx = item["episode_index"].item()
         # Use the absolute index from the dataset for delta timestamp calculations
         abs_idx = item["index"].item()
+        if _debug_dataset_item():
+            logger.info("[dataset] idx=%s abs_idx=%s ep_idx=%s", idx, abs_idx, ep_idx)
 
         query_indices = None
         if self.delta_indices is not None:

@@ -30,7 +30,7 @@ class TestLatentSmolCELoss:
         code_seq_len = 4  # S
         codebook_size = 8  # K
 
-        # Simulated logits from laq_head (requires_grad for backprop)
+        # Simulated logits from lam_head (requires_grad for backprop)
         logits = torch.randn(batch_size, code_seq_len, codebook_size, requires_grad=True)
 
         # Simulated target codes
@@ -170,7 +170,7 @@ class TestLatentSmolConfig:
         """Test observation_delta_indices for latent mode."""
         from lerobot.policies.latent_smol.configuration_latent_smol import LatentSmolConfig
 
-        config = LatentSmolConfig(laq_future_frames=10)
+        config = LatentSmolConfig(lam_future_frames=10)
         assert config.observation_delta_indices == [0, 10]
 
     def test_config_observation_delta_indices_action(self):
@@ -181,11 +181,11 @@ class TestLatentSmolConfig:
         assert config.observation_delta_indices == [0]
 
     def test_config_latent_mode_requires_future_frames(self):
-        """Test that latent mode raises error if laq_future_frames not set."""
+        """Test that latent mode raises error if lam_future_frames not set."""
         from lerobot.policies.latent_smol.configuration_latent_smol import LatentSmolConfig
 
-        config = LatentSmolConfig(head_mode="latent", laq_future_frames=-1)
-        with pytest.raises(ValueError, match="laq_future_frames must be >0"):
+        config = LatentSmolConfig(head_mode="latent", lam_future_frames=-1)
+        with pytest.raises(ValueError, match="lam_future_frames must be >0"):
             _ = config.observation_delta_indices
 
 

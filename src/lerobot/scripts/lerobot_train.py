@@ -15,12 +15,14 @@
 # limitations under the License.
 import dataclasses
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
 import numpy as np
+import psutil
 import torch
 import torch.nn.functional as F  # noqa: N812
 from accelerate import Accelerator
@@ -55,6 +57,119 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+
+def _stage3_debug_memory_enabled() -> bool:
+    value = os.environ.get("HLRP_STAGE3_DEBUG_MEMORY", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _memory_debug_snapshot(label: str) -> None:
+    if not _stage3_debug_memory_enabled():
+        return
+    proc = psutil.Process()
+    rss_gb = proc.memory_info().rss / (1024**3)
+    msg = f"[mem] {label} rss_gb={rss_gb:.2f}"
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        alloc_gb = torch.cuda.memory_allocated(device) / (1024**3)
+        reserved_gb = torch.cuda.memory_reserved(device) / (1024**3)
+        max_alloc_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+        msg += (
+            f" cuda_alloc_gb={alloc_gb:.2f}"
+            f" cuda_reserved_gb={reserved_gb:.2f}"
+            f" cuda_max_alloc_gb={max_alloc_gb:.2f}"
+        )
+    logging.info(msg)
+
+
+def _sanitize_output_dict_for_logging(output_dict: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(output_dict, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, value in output_dict.items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, (int, float)):
+            sanitized[key] = value
+            continue
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                sanitized[key] = float(value.detach().cpu().item())
+            continue
+    return sanitized
+
+
+def _merge_microbatch_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    if not output_dicts:
+        return merged
+
+    output_sums: dict[str, float] = {}
+    output_counts: dict[str, int] = {}
+    action_samples = 0.0
+    action_denominator = 0.0
+    latent_samples = 0.0
+    latent_denominator = 0.0
+
+    for output_dict in output_dicts:
+        for key, value in output_dict.items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, (int, float)):
+                output_sums[key] = output_sums.get(key, 0.0) + float(value)
+                output_counts[key] = output_counts.get(key, 0) + 1
+        action_samples += float(output_dict.get("batch_action_supervised_samples", 0.0))
+        action_denominator += float(output_dict.get("_action_supervised_denominator", 0.0))
+        latent_samples += float(output_dict.get("batch_latent_supervised_samples", 0.0))
+        latent_denominator += float(output_dict.get("_latent_supervised_denominator", 0.0))
+
+    merged.update({k: output_sums[k] / max(1, output_counts[k]) for k in output_sums})
+    if action_denominator > 0.0:
+        merged["batch_action_supervised_samples"] = action_samples
+        merged["batch_action_supervised_denominator"] = action_denominator
+        merged["batch_action_supervised_fraction"] = action_samples / action_denominator
+    if latent_denominator > 0.0:
+        merged["batch_latent_supervised_samples"] = latent_samples
+        merged["batch_latent_supervised_denominator"] = latent_denominator
+        merged["batch_latent_supervised_fraction"] = latent_samples / latent_denominator
+    return merged
+
+
+def _format_supervision_batch_log(output_dict: dict[str, Any] | None) -> str | None:
+    if not isinstance(output_dict, dict):
+        return None
+
+    parts: list[str] = []
+    action_fraction = output_dict.get("batch_action_supervised_fraction")
+    action_samples = output_dict.get("batch_action_supervised_samples")
+    action_denominator = output_dict.get("batch_action_supervised_denominator")
+    if isinstance(action_fraction, (int, float)):
+        if isinstance(action_samples, (int, float)) and isinstance(action_denominator, (int, float)):
+            parts.append(
+                f"action={float(action_fraction):.3f} ({float(action_samples):.1f}/{float(action_denominator):.1f})"
+            )
+        elif isinstance(action_samples, (int, float)):
+            parts.append(f"action={float(action_fraction):.3f} ({float(action_samples):.1f})")
+        else:
+            parts.append(f"action={float(action_fraction):.3f}")
+
+    latent_fraction = output_dict.get("batch_latent_supervised_fraction")
+    latent_samples = output_dict.get("batch_latent_supervised_samples")
+    latent_denominator = output_dict.get("batch_latent_supervised_denominator")
+    if isinstance(latent_fraction, (int, float)):
+        if isinstance(latent_samples, (int, float)) and isinstance(latent_denominator, (int, float)):
+            parts.append(
+                f"latent={float(latent_fraction):.3f} ({float(latent_samples):.1f}/{float(latent_denominator):.1f})"
+            )
+        elif isinstance(latent_samples, (int, float)):
+            parts.append(f"latent={float(latent_fraction):.3f} ({float(latent_samples):.1f})")
+        else:
+            parts.append(f"latent={float(latent_fraction):.3f}")
+
+    if not parts:
+        return None
+    return "batch_sup " + " ".join(parts)
 
 
 def update_policy(
@@ -97,8 +212,11 @@ def update_policy(
     rabc_batch_weights = None
     rabc_batch_stats = None
     if rabc_weights_provider is not None:
-        rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
+        rabc_batch_weights, rabc_batch_stats = (
+            rabc_weights_provider.compute_batch_weights(batch)
+        )
 
+    _memory_debug_snapshot("before_forward")
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         # Use per-sample loss when RA-BC is enabled for proper weighting
@@ -109,7 +227,9 @@ def update_policy(
             # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
             # rabc_batch_weights is already normalized to sum to batch_size
             epsilon = 1e-6
-            loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
+            loss = (per_sample_loss * rabc_batch_weights).sum() / (
+                rabc_batch_weights.sum() + epsilon
+            )
             # Log raw mean weight (before normalization) - this is the meaningful metric
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
@@ -119,8 +239,10 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
+    _memory_debug_snapshot("after_forward")
     # Use accelerator's backward method
     accelerator.backward(loss)
+    _memory_debug_snapshot("after_backward")
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
@@ -133,8 +255,10 @@ def update_policy(
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
+    _memory_debug_snapshot("after_optimizer_step")
 
     optimizer.zero_grad()
+    _memory_debug_snapshot("after_zero_grad")
 
     # Step through pytorch scheduler at every batch instead of epoch
     if lr_scheduler is not None:
@@ -148,7 +272,7 @@ def update_policy(
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
-    return train_metrics, output_dict
+    return train_metrics, _sanitize_output_dict_for_logging(output_dict)
 
 
 def _to_uint8_hwc(img_chw: torch.Tensor) -> np.ndarray:
@@ -174,7 +298,9 @@ def _decode_instructions(
         return [""] * num_samples
 
     token_ids_cpu = token_ids[:num_samples].detach().cpu()
-    mask_cpu = attn_mask[:num_samples].detach().cpu().bool() if attn_mask is not None else None
+    mask_cpu = (
+        attn_mask[:num_samples].detach().cpu().bool() if attn_mask is not None else None
+    )
 
     texts: list[str] = []
     for i in range(token_ids_cpu.shape[0]):
@@ -187,7 +313,7 @@ def _decode_instructions(
     return texts
 
 
-def _build_laq_viz_table(
+def _build_lam_viz_table(
     cfg: TrainPipelineConfig,
     batch: dict[str, Any],
     output_dict: dict[str, Any],
@@ -195,16 +321,20 @@ def _build_laq_viz_table(
     wandb: Any,
     step: int,
 ) -> Any:
-    """Create a small W&B table for LAQ latent pretraining debugging."""
-    num_samples = int(max(1, getattr(cfg, "laq_viz_num_samples", 4)))
+    """Create a small W&B table for LAM latent pretraining debugging."""
+    num_samples = int(max(1, getattr(cfg, "lam_viz_num_samples", 4)))
 
     # Instruction text
     lang_tokens = batch.get(OBS_LANGUAGE_TOKENS)
     lang_mask = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
-    instructions = _decode_instructions(tokenizer, lang_tokens, lang_mask, num_samples=num_samples)
+    instructions = _decode_instructions(
+        tokenizer, lang_tokens, lang_mask, num_samples=num_samples
+    )
 
-    # Images: (t=0, t=Δ) pair from laq_camera_key
-    camera_key = getattr(cfg.policy, "laq_camera_key", None) if cfg.policy is not None else None
+    # Images: (t=0, t=Δ) pair from lam_camera_key
+    camera_key = (
+        getattr(cfg.policy, "lam_camera_key", None) if cfg.policy is not None else None
+    )
     frames = batch.get(camera_key) if camera_key else None
     images: list[Any] = []
     if isinstance(frames, torch.Tensor) and frames.ndim == 5:
@@ -220,14 +350,17 @@ def _build_laq_viz_table(
                 images.append(wandb.Image(np.concatenate([img0, img1], axis=1)))
 
     # GT + predicted codes
-    gt_codes_t = batch.get("laq_codes")
-    valid_pair_t = batch.get("laq_valid_pair")
+    gt_codes_t = batch.get("lam_codes")
+    valid_pair_t = batch.get("lam_valid_pair")
     logits_t = output_dict.get("_logits")
 
     gt_codes = (
         gt_codes_t[:num_samples].detach().cpu().long().tolist()
         if isinstance(gt_codes_t, torch.Tensor) and gt_codes_t.ndim >= 2
-        else [[-1] * int(getattr(cfg.policy, "laq_code_seq_len", 4)) for _ in range(num_samples)]
+        else [
+            [-1] * int(getattr(cfg.policy, "lam_code_seq_len", 4))
+            for _ in range(num_samples)
+        ]
     )
     valid_pair = (
         valid_pair_t[:num_samples].detach().cpu().bool().tolist()
@@ -312,7 +445,9 @@ def wrap_policy_in_peft_model(cfg, policy):
 
     peft_config_policy = get_default_peft_configuration(cfg.policy.type)
     peft_config_cli = dataclasses.asdict(cfg.peft) if cfg.peft else {}
-    peft_config_cli["modules_to_save"] = peft_config_cli["full_training_modules"]  # compatibility with PEFT
+    peft_config_cli["modules_to_save"] = peft_config_cli[
+        "full_training_modules"
+    ]  # compatibility with PEFT
     peft_method_type = PeftType[peft_config_cli["method_type"].upper()]
     peft_config_cls = PEFT_TYPE_TO_CONFIG_MAPPING[peft_method_type]
 
@@ -355,6 +490,50 @@ def wrap_policy_in_peft_model(cfg, policy):
     policy.config.use_peft = True
 
     return policy
+
+
+def make_offline_dataloader(
+    cfg: TrainPipelineConfig,
+    dataset,
+    *,
+    device: torch.device,
+) -> torch.utils.data.DataLoader:
+    """Create the offline-training dataloader.
+
+    Datasets that implement `build_sampler()` own the global sample order. The sampler receives a shared
+    seed and must stay rank-agnostic; Accelerate shards the prepared dataloader across processes.
+    """
+
+    drop_n_last_frames = int(getattr(cfg.policy, "drop_n_last_frames", 0))
+    sampler = None
+    shuffle = True
+
+    if hasattr(dataset, "build_sampler"):
+        sampler = dataset.build_sampler(
+            seed=0 if cfg.seed is None else int(cfg.seed),
+            drop_n_last_frames=drop_n_last_frames,
+        )
+        shuffle = False
+    elif hasattr(cfg.policy, "drop_n_last_frames"):
+        sampler = EpisodeAwareSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            episode_indices_to_use=dataset.episodes,
+            drop_n_last_frames=drop_n_last_frames,
+            shuffle=True,
+        )
+        shuffle = False
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        num_workers=cfg.num_workers,
+        batch_size=cfg.batch_size,
+        shuffle=shuffle and not cfg.dataset.streaming,
+        sampler=sampler,
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
+    )
 
 
 @parser.wrap()
@@ -409,7 +588,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     else:
         wandb_logger = None
         if is_main_process:
-            logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
+            logging.info(
+                colored("Logs will be saved locally.", "yellow", attrs=["bold"])
+            )
 
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
@@ -436,7 +617,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+        eval_env = make_env(
+            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+        )
 
     if is_main_process:
         logging.info("Creating policy")
@@ -458,7 +641,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
+    if (
+        cfg.policy.pretrained_path and not cfg.resume
+    ) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
@@ -469,22 +654,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        if not cfg.resume:
+            processor_kwargs["preprocessor_overrides"]["normalizer_processor"] = {
                 "stats": dataset.meta.stats,
-                "features": {**policy.config.input_features, **policy.config.output_features},
+                "features": {
+                    **policy.config.input_features,
+                    **policy.config.output_features,
+                },
                 "norm_map": policy.config.normalization_mapping,
-            },
-        }
-        processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
-        }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
+            }
+            postprocessor_kwargs["postprocessor_overrides"] = {
+                "unnormalizer_processor": {
+                    "stats": dataset.meta.stats,
+                    "features": policy.config.output_features,
+                    "norm_map": policy.config.normalization_mapping,
+                },
+            }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -510,7 +697,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         head_mode = getattr(cfg, "rabc_head_mode", "sparse")
         logging.info(f"Loading SARM progress for RA-BC from {cfg.rabc_progress_path}")
-        logging.info(f"Using chunk_size={chunk_size} from policy config, head_mode={head_mode}")
+        logging.info(
+            f"Using chunk_size={chunk_size} from policy config, head_mode={head_mode}"
+        )
         rabc_weights = RABCWeights(
             progress_path=cfg.rabc_progress_path,
             chunk_size=chunk_size,
@@ -520,50 +709,62 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             device=device,
         )
 
-    # Initialize LAQ teacher for latent_smol in latent mode
-    laq_teacher = None
-    if (cfg.policy.type == "latent_smol" and
-        getattr(cfg.policy, 'head_mode', 'action') == "latent"):
-        from lerobot.teachers.laq_teacher import LAQTeacher, LAQTeacherConfig
+    # Initialize LAM teacher for latent_smol in latent mode
+    lam_teacher = None
+    if (
+        cfg.policy.type == "latent_smol"
+        and getattr(cfg.policy, "head_mode", "action") == "latent"
+    ):
+        from lerobot.teachers.lam_teacher import LAMTeacher, LAMTeacherConfig
 
-        if cfg.policy.laq_checkpoint_path is None:
-            raise ValueError("laq_checkpoint_path required for head_mode='latent'")
+        if cfg.policy.lam_checkpoint_path is None:
+            raise ValueError("lam_checkpoint_path required for head_mode='latent'")
 
-        laq_teacher = LAQTeacher(LAQTeacherConfig(
-            checkpoint_path=cfg.policy.laq_checkpoint_path,
-            device=str(device),
-        ))
-        laq_teacher.eval()
+        lam_teacher = LAMTeacher(
+            LAMTeacherConfig(
+                checkpoint_path=cfg.policy.lam_checkpoint_path,
+                device=str(device),
+            )
+        )
+        lam_teacher.eval()
         if is_main_process:
-            logging.info(f"LAQ Teacher: K={laq_teacher.codebook_size}, S={laq_teacher.code_seq_len}")
+            logging.info(
+                f"LAM Teacher: K={lam_teacher.codebook_size}, S={lam_teacher.code_seq_len}"
+            )
 
-    laq_viz_enabled = (
+    lam_viz_enabled = (
         is_main_process
         and wandb_logger is not None
-        and int(getattr(cfg, "laq_viz_freq", 0)) > 0
+        and int(getattr(cfg, "lam_viz_freq", 0)) > 0
         and cfg.policy.type == "latent_smol"
         and getattr(cfg.policy, "head_mode", "action") == "latent"
     )
-    laq_viz_wandb = wandb_logger._wandb if wandb_logger is not None else None
-    laq_viz_tokenizer = None
-    if laq_viz_enabled:
+    lam_viz_wandb = wandb_logger._wandb if wandb_logger is not None else None
+    lam_viz_tokenizer = None
+    if lam_viz_enabled:
         try:
             # Cache the tokenizer once (used only for visualization)
-            laq_viz_tokenizer = policy.model.vlm_with_expert.processor.tokenizer
+            lam_viz_tokenizer = policy.model.vlm_with_expert.processor.tokenizer
         except Exception as e:
-            logging.warning(f"LAQ viz enabled but tokenizer lookup failed: {e}")
-            laq_viz_tokenizer = None
+            logging.warning(f"LAM viz enabled but tokenizer lookup failed: {e}")
+            lam_viz_tokenizer = None
 
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        step, optimizer, lr_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, lr_scheduler
+        )
 
-    num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    num_learnable_params = sum(
+        p.numel() for p in policy.parameters() if p.requires_grad
+    )
     num_total_params = sum(p.numel() for p in policy.parameters())
 
     if is_main_process:
-        logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+        logging.info(
+            colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}"
+        )
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
@@ -581,34 +782,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 f"Effective batch size: {cfg.batch_size} x {grad_accum_steps} x {num_processes} = {effective_bs}"
             )
         else:
-            logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
-        logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
+            logging.info(
+                f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}"
+            )
+        logging.info(
+            f"{num_learnable_params=} ({format_big_number(num_learnable_params)})"
+        )
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-    )
+    dataloader = make_offline_dataloader(cfg, dataset, device=device)
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
@@ -649,71 +831,91 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         policy.train()
 
         next_step = step + 1
-        laq_viz_due = (
-            laq_viz_enabled
-            and laq_viz_wandb is not None
-            and next_step % int(getattr(cfg, "laq_viz_freq", 0)) == 0
+        lam_viz_due = (
+            lam_viz_enabled
+            and lam_viz_wandb is not None
+            and next_step % int(getattr(cfg, "lam_viz_freq", 0)) == 0
         )
-        laq_viz_table = None
+        lam_viz_table = None
 
         dataloading_total_s = 0.0
         output_dict = {}
 
         if grad_accum_steps > 1:
-            output_sums: dict[str, float] = {}
-            output_counts: dict[str, int] = {}
+            microbatch_output_dicts: list[dict[str, Any]] = []
             loss_sum = 0.0
 
             optimizer.zero_grad()
 
             for micro_idx in range(grad_accum_steps):
                 data_start = time.perf_counter()
+                _memory_debug_snapshot(f"before_dataloader_micro_{micro_idx}")
                 batch = next(dl_iter)
+                _memory_debug_snapshot(f"after_dataloader_micro_{micro_idx}")
                 batch = preprocessor(batch)
+                _memory_debug_snapshot(f"after_preprocessor_micro_{micro_idx}")
 
-                # Generate LAQ codes for latent_smol (only when head_mode=latent)
-                if laq_teacher is not None:
-                    from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+                # Generate LAM codes for latent_smol (only when head_mode=latent)
+                if lam_teacher is not None:
+                    from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
 
-                    # Disable autocast to avoid fp16/bf16 surprises with LAQ
-                    with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
-                        camera_key = cfg.policy.laq_camera_key
+                    # Disable autocast to avoid fp16/bf16 surprises with LAM
+                    with (
+                        torch.no_grad(),
+                        torch.autocast(device_type=device.type, enabled=False),
+                    ):
+                        camera_key = cfg.policy.lam_camera_key
                         if camera_key not in batch:
-                            image_keys = sorted([k for k in batch.keys() if k.startswith("observation.images.")])
+                            image_keys = sorted(
+                                [
+                                    k
+                                    for k in batch.keys()
+                                    if k.startswith("observation.images.")
+                                ]
+                            )
                             raise KeyError(
-                                f"LAQ teacher camera key '{camera_key}' not found in batch. "
+                                f"LAM teacher camera key '{camera_key}' not found in batch. "
                                 f"Available image keys: {image_keys}. "
-                                "Set --policy.laq_camera_key=<one of the available image keys>."
+                                "Set --policy.lam_camera_key=<one of the available image keys>."
                             )
                         frames = batch[camera_key]
 
                         # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
                         if frames.shape[-1] == 3:  # [B, 2, H, W, C]
                             frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
-                        assert frames.shape[2] == 3, f"Expected C=3, got shape {frames.shape}"
+                        assert (
+                            frames.shape[2] == 3
+                        ), f"Expected C=3, got shape {frames.shape}"
 
                         # Default is_pad on same device as frames
                         is_pad = batch.get(
                             f"{camera_key}_is_pad",
-                            torch.zeros(frames.shape[:2], dtype=torch.bool, device=frames.device),
+                            torch.zeros(
+                                frames.shape[:2], dtype=torch.bool, device=frames.device
+                            ),
                         )
 
                         valid_pair = valid_pair_from_is_pad(is_pad)
 
-                        # Resize to LAQ input size (use reshape for non-contiguous safety)
+                        # Resize to LAM input size (use reshape for non-contiguous safety)
                         B, T, C, H, W = frames.shape
-                        resize_hw = cfg.policy.laq_resize_hw
+                        resize_hw = cfg.policy.lam_resize_hw
                         frames_flat = frames.reshape(B * T, C, H, W)
                         frames_resized = F.interpolate(
-                            frames_flat, size=resize_hw, mode="bilinear", align_corners=False
+                            frames_flat,
+                            size=resize_hw,
+                            mode="bilinear",
+                            align_corners=False,
                         )
                         frames = frames_resized.reshape(B, T, C, *resize_hw)
 
                         # frames already on device after preprocessor (DeviceProcessorStep)
-                        codes = laq_teacher.codes_from_pair(frames)  # [B, 4]
+                        codes = lam_teacher.codes_from_pair(frames)  # [B, 4]
 
-                        batch["laq_codes"] = codes
-                        batch["laq_valid_pair"] = valid_pair.to(codes.device)  # Ensure same device
+                        batch["lam_codes"] = codes
+                        batch["lam_valid_pair"] = valid_pair.to(
+                            codes.device
+                        )  # Ensure same device
 
                 dataloading_total_s += time.perf_counter() - data_start
 
@@ -723,49 +925,56 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     rabc_batch_weights = None
                     rabc_batch_stats = None
                     if rabc_weights is not None:
-                        rabc_batch_weights, rabc_batch_stats = rabc_weights.compute_batch_weights(batch)
+                        rabc_batch_weights, rabc_batch_stats = (
+                            rabc_weights.compute_batch_weights(batch)
+                        )
 
                     # Use per-sample loss when RA-BC is enabled for proper weighting
                     if rabc_batch_weights is not None:
-                        per_sample_loss, output_dict_local = policy.forward(batch, reduction="none")
+                        per_sample_loss, output_dict_local = policy.forward(
+                            batch, reduction="none"
+                        )
                         epsilon = 1e-6
                         loss = (per_sample_loss * rabc_batch_weights).sum() / (
                             rabc_batch_weights.sum() + epsilon
                         )
-                        output_dict_local["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-                        output_dict_local["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-                        output_dict_local["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+                        output_dict_local["rabc_mean_weight"] = rabc_batch_stats[
+                            "raw_mean_weight"
+                        ]
+                        output_dict_local["rabc_num_zero_weight"] = rabc_batch_stats[
+                            "num_zero_weight"
+                        ]
+                        output_dict_local["rabc_num_full_weight"] = rabc_batch_stats[
+                            "num_full_weight"
+                        ]
                     else:
                         loss, output_dict_local = policy.forward(batch)
 
-                if laq_viz_due and laq_viz_table is None:
+                if lam_viz_due and lam_viz_table is None:
                     try:
-                        laq_viz_table = _build_laq_viz_table(
+                        lam_viz_table = _build_lam_viz_table(
                             cfg=cfg,
                             batch=batch,
                             output_dict=output_dict_local,
-                            tokenizer=laq_viz_tokenizer,
-                            wandb=laq_viz_wandb,
+                            tokenizer=lam_viz_tokenizer,
+                            wandb=lam_viz_wandb,
                             step=next_step,
                         )
                     except Exception as e:
-                        logging.warning(f"Failed to build LAQ viz table: {e}")
-                        laq_viz_table = None
+                        logging.warning(f"Failed to build LAM viz table: {e}")
+                        lam_viz_table = None
 
                 loss_sum += float(loss.item())
                 accelerator.backward(loss / grad_accum_steps)
 
                 if output_dict_local:
-                    for k, v in output_dict_local.items():
-                        if k.startswith("_"):
-                            continue
-                        if isinstance(v, (int, float)):
-                            output_sums[k] = output_sums.get(k, 0.0) + float(v)
-                            output_counts[k] = output_counts.get(k, 0) + 1
+                    microbatch_output_dicts.append(output_dict_local)
 
             # Clip gradients if specified
             if cfg.optimizer.grad_clip_norm > 0:
-                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), cfg.optimizer.grad_clip_norm)
+                grad_norm = accelerator.clip_grad_norm_(
+                    policy.parameters(), cfg.optimizer.grad_clip_norm
+                )
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), float("inf"), error_if_nonfinite=False
@@ -776,7 +985,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-            if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+            if has_method(
+                accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"
+            ):
                 accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
             train_tracker.loss = loss_sum / grad_accum_steps
@@ -785,52 +996,75 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             train_tracker.update_s = time.perf_counter() - start_time
             train_tracker.dataloading_s = dataloading_total_s
 
-            output_dict = {k: output_sums[k] / max(1, output_counts[k]) for k in output_sums}
+            output_dict = _merge_microbatch_output_dicts(microbatch_output_dicts)
         else:
+            _memory_debug_snapshot("before_dataloader")
             batch = next(dl_iter)
+            _memory_debug_snapshot("after_dataloader")
             batch = preprocessor(batch)
+            _memory_debug_snapshot("after_preprocessor")
 
-            # Generate LAQ codes for latent_smol (only when head_mode=latent)
-            if laq_teacher is not None:
-                from lerobot.teachers.laq_teacher import valid_pair_from_is_pad
+            # Generate LAM codes for latent_smol (only when head_mode=latent)
+            if lam_teacher is not None:
+                from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
 
-                # Disable autocast to avoid fp16/bf16 surprises with LAQ
-                with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
-                    camera_key = cfg.policy.laq_camera_key
+                # Disable autocast to avoid fp16/bf16 surprises with LAM
+                with (
+                    torch.no_grad(),
+                    torch.autocast(device_type=device.type, enabled=False),
+                ):
+                    camera_key = cfg.policy.lam_camera_key
                     if camera_key not in batch:
-                        image_keys = sorted([k for k in batch.keys() if k.startswith("observation.images.")])
+                        image_keys = sorted(
+                            [
+                                k
+                                for k in batch.keys()
+                                if k.startswith("observation.images.")
+                            ]
+                        )
                         raise KeyError(
-                            f"LAQ teacher camera key '{camera_key}' not found in batch. "
+                            f"LAM teacher camera key '{camera_key}' not found in batch. "
                             f"Available image keys: {image_keys}. "
-                            "Set --policy.laq_camera_key=<one of the available image keys>."
+                            "Set --policy.lam_camera_key=<one of the available image keys>."
                         )
                     frames = batch[camera_key]
 
                     # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
                     if frames.shape[-1] == 3:  # [B, 2, H, W, C]
                         frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
-                    assert frames.shape[2] == 3, f"Expected C=3, got shape {frames.shape}"
+                    assert (
+                        frames.shape[2] == 3
+                    ), f"Expected C=3, got shape {frames.shape}"
 
                     # Default is_pad on same device as frames
                     is_pad = batch.get(
                         f"{camera_key}_is_pad",
-                        torch.zeros(frames.shape[:2], dtype=torch.bool, device=frames.device),
+                        torch.zeros(
+                            frames.shape[:2], dtype=torch.bool, device=frames.device
+                        ),
                     )
 
                     valid_pair = valid_pair_from_is_pad(is_pad)
 
-                    # Resize to LAQ input size (use reshape for non-contiguous safety)
+                    # Resize to LAM input size (use reshape for non-contiguous safety)
                     B, T, C, H, W = frames.shape
-                    resize_hw = cfg.policy.laq_resize_hw
+                    resize_hw = cfg.policy.lam_resize_hw
                     frames_flat = frames.reshape(B * T, C, H, W)
-                    frames_resized = F.interpolate(frames_flat, size=resize_hw, mode="bilinear", align_corners=False)
+                    frames_resized = F.interpolate(
+                        frames_flat,
+                        size=resize_hw,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
                     frames = frames_resized.reshape(B, T, C, *resize_hw)
 
                     # frames already on device after preprocessor (DeviceProcessorStep)
-                    codes = laq_teacher.codes_from_pair(frames)  # [B, 4]
+                    codes = lam_teacher.codes_from_pair(frames)  # [B, 4]
 
-                    batch["laq_codes"] = codes
-                    batch["laq_valid_pair"] = valid_pair.to(codes.device)  # Ensure same device
+                    batch["lam_codes"] = codes
+                    batch["lam_valid_pair"] = valid_pair.to(
+                        codes.device
+                    )  # Ensure same device
 
             train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -845,37 +1079,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 rabc_weights_provider=rabc_weights,
             )
 
-            if laq_viz_due and laq_viz_table is None:
+            if lam_viz_due and lam_viz_table is None:
                 try:
-                    laq_viz_table = _build_laq_viz_table(
+                    lam_viz_table = _build_lam_viz_table(
                         cfg=cfg,
                         batch=batch,
                         output_dict=output_dict,
-                        tokenizer=laq_viz_tokenizer,
-                        wandb=laq_viz_wandb,
+                        tokenizer=lam_viz_tokenizer,
+                        wandb=lam_viz_wandb,
                         step=next_step,
                     )
                 except Exception as e:
-                    logging.warning(f"Failed to build LAQ viz table: {e}")
-                    laq_viz_table = None
+                    logging.warning(f"Failed to build LAM viz table: {e}")
+                    lam_viz_table = None
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
         train_tracker.step()
-        if laq_viz_table is not None and laq_viz_wandb is not None:
-            laq_viz_wandb.log({"train/laq_viz": laq_viz_table}, step=step)
+        if lam_viz_table is not None and lam_viz_wandb is not None:
+            lam_viz_wandb.log({"train/lam_viz": lam_viz_table}, step=step)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
             logging.info(train_tracker)
+            supervision_log = _format_supervision_batch_log(output_dict)
+            if supervision_log is not None:
+                logging.info(supervision_log)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
                     # Filter out internal tensors (prefixed with _) from scalar logging
-                    scalar_dict = {k: v for k, v in output_dict.items() if not k.startswith("_")}
+                    scalar_dict = {
+                        k: v for k, v in output_dict.items() if not k.startswith("_")
+                    }
                     wandb_log_dict.update(scalar_dict)
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
@@ -894,7 +1133,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                checkpoint_dir = get_step_checkpoint_dir(
+                    cfg.output_dir, cfg.steps, step
+                )
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -956,7 +1197,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    wandb_logger.log_video(
+                        eval_info["overall"]["video_paths"][0], step, mode="eval"
+                    )
 
             accelerator.wait_for_everyone()
 

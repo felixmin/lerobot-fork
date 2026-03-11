@@ -61,9 +61,9 @@ class TrainPipelineConfig(HubMixin):
     log_freq: int = 200
     # Optional visualization hooks (W&B only). Disabled by default.
     # For latent_smol head_mode=latent, this logs a small table with:
-    # instruction text, (t=0, t=Δ) image pair, LAQ gt codes and predicted codes.
-    laq_viz_freq: int = 0  # 0 disables; recommend setting to a multiple of log_freq (e.g. 2000).
-    laq_viz_num_samples: int = 4
+    # instruction text, (t=0, t=Δ) image pair, LAM gt codes and predicted codes.
+    lam_viz_freq: int = 0  # 0 disables; recommend setting to a multiple of log_freq (e.g. 2000).
+    lam_viz_num_samples: int = 4
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.

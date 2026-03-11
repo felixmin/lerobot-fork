@@ -1,0 +1,50 @@
+FROM nvcr.io/nvidia/pytorch:25.10-py3
+
+# Configure environment variables
+ENV DEBIAN_FRONTEND=noninteractive \
+    MUJOCO_GL=egl
+
+# Install system dependencies (as root)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git curl \
+    libglib2.0-0 \
+    libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+    libswscale-dev libswresample-dev libavfilter-dev \
+    ffmpeg \
+    pkg-config cmake ninja-build \
+    && useradd --create-home --shell /bin/bash user_lerobot \
+    && usermod -aG sudo user_lerobot \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/high-level-robot-planner
+RUN chown -R user_lerobot:user_lerobot /workspace
+
+# Preserve the PyTorch stack from the NGC base image:
+# 1) pin existing torch/torchvision/torchaudio versions into constraints
+# 2) install egl_probe
+# 3) install lerobot + libero with torch packages constrained
+# Policy plugin is installed at runtime from the mounted repo.
+RUN python -c "import importlib.util, importlib; \
+pkgs=['torch','torchvision','torchaudio']; \
+lines=[]; \
+[lines.append(f'{p}=={importlib.import_module(p).__version__}') for p in pkgs if importlib.util.find_spec(p) is not None]; \
+open('/tmp/torch-constraints.txt','w',encoding='utf-8').write('\\n'.join(lines) + ('\\n' if lines else ''))" && \
+    python -m pip install --no-build-isolation egl_probe && \
+    python -m pip install --constraint /tmp/torch-constraints.txt "lerobot[libero] @ git+https://github.com/huggingface/lerobot.git@main" "hf-libero>=0.1.3" && \
+    python -m pip install pynvml && \
+    python -m pip check
+
+# Switch to the non-root user for runtime
+USER user_lerobot
+
+# Runtime cache locations for the non-root user
+ENV HOME=/home/user_lerobot \
+    HF_HOME=/home/user_lerobot/.cache/huggingface \
+    HF_LEROBOT_HOME=/home/user_lerobot/.cache/huggingface/lerobot \
+    TORCH_HOME=/home/user_lerobot/.cache/torch \
+    TRITON_CACHE_DIR=/home/user_lerobot/.cache/triton
+
+
+# Set the default command
+CMD ["/bin/bash"]

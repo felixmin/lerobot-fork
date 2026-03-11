@@ -1,4 +1,4 @@
-# LatentSmol runbook (LAQ latent pretraining → action finetune)
+# LatentSmol runbook (LAM latent pretraining → action finetune)
 
 This document is a copy/paste runbook for starting and resuming `latent_smol` runs while ensuring:
 
@@ -57,9 +57,9 @@ print("features:", list(m.features))
 PY'
 ```
 
-Use one of the printed `camera_keys` as `--policy.laq_camera_key=...`.
+Use one of the printed `camera_keys` as `--policy.lam_camera_keys=...`.
 
-## 2) Stage 1 (Mode A): latent pretraining on LAQ codes
+## 2) Stage 1 (Mode A): latent pretraining on LAM codes
 
 ### Quick smoke run (recommended before any long run)
 
@@ -76,9 +76,9 @@ export HF_TOKEN="$(cat /home/felix/.cache/huggingface/token 2>/dev/null || true)
 python -m lerobot.scripts.lerobot_train \
   --policy.type=latent_smol \
   --policy.head_mode=latent \
-  --policy.laq_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/laq-stepstep052500.ckpt \
-  --policy.laq_camera_key=observation.images.image \
-  --policy.laq_future_seconds=1.0 \
+  --policy.lam_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/stage1-lam-step=052500.ckpt \
+  --policy.lam_camera_keys=observation.images.image \
+  --policy.lam_future_seconds=1.0 \
   --policy.load_vlm_weights=false \
   --policy.push_to_hub=false \
   --dataset.repo_id=HuggingFaceVLA/libero \
@@ -114,9 +114,9 @@ export HF_TOKEN="$(cat /home/felix/.cache/huggingface/token 2>/dev/null || true)
 python -m lerobot.scripts.lerobot_train \
   --policy.type=latent_smol \
   --policy.head_mode=latent \
-  --policy.laq_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/laq-stepstep052500.ckpt \
-  --policy.laq_camera_key=observation.images.image \
-  --policy.laq_future_seconds=1.0 \
+  --policy.lam_checkpoint_path=/mnt/data/workspace/code/high-level-robot-planner/stage1-lam-step=052500.ckpt \
+  --policy.lam_camera_keys=observation.images.image \
+  --policy.lam_future_seconds=1.0 \
   --policy.load_vlm_weights=false \
   --policy.push_to_hub=false \
   --dataset.repo_id=HuggingFaceVLA/libero \
