@@ -15,14 +15,12 @@
 # limitations under the License.
 import dataclasses
 import logging
-import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
 import numpy as np
-import psutil
 import torch
 import torch.nn.functional as F  # noqa: N812
 from accelerate import Accelerator
@@ -57,30 +55,6 @@ from lerobot.utils.utils import (
     init_logging,
 )
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
-
-
-def _stage3_debug_memory_enabled() -> bool:
-    value = os.environ.get("HLRP_STAGE3_DEBUG_MEMORY", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _memory_debug_snapshot(label: str) -> None:
-    if not _stage3_debug_memory_enabled():
-        return
-    proc = psutil.Process()
-    rss_gb = proc.memory_info().rss / (1024**3)
-    msg = f"[mem] {label} rss_gb={rss_gb:.2f}"
-    if torch.cuda.is_available():
-        device = torch.cuda.current_device()
-        alloc_gb = torch.cuda.memory_allocated(device) / (1024**3)
-        reserved_gb = torch.cuda.memory_reserved(device) / (1024**3)
-        max_alloc_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
-        msg += (
-            f" cuda_alloc_gb={alloc_gb:.2f}"
-            f" cuda_reserved_gb={reserved_gb:.2f}"
-            f" cuda_max_alloc_gb={max_alloc_gb:.2f}"
-        )
-    logging.info(msg)
 
 
 def _sanitize_output_dict_for_logging(output_dict: dict[str, Any] | None) -> dict[str, Any]:
@@ -216,7 +190,6 @@ def update_policy(
             rabc_weights_provider.compute_batch_weights(batch)
         )
 
-    _memory_debug_snapshot("before_forward")
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         # Use per-sample loss when RA-BC is enabled for proper weighting
@@ -239,10 +212,8 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    _memory_debug_snapshot("after_forward")
     # Use accelerator's backward method
     accelerator.backward(loss)
-    _memory_debug_snapshot("after_backward")
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
@@ -255,10 +226,8 @@ def update_policy(
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
-    _memory_debug_snapshot("after_optimizer_step")
 
     optimizer.zero_grad()
-    _memory_debug_snapshot("after_zero_grad")
 
     # Step through pytorch scheduler at every batch instead of epoch
     if lr_scheduler is not None:
@@ -849,11 +818,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             for micro_idx in range(grad_accum_steps):
                 data_start = time.perf_counter()
-                _memory_debug_snapshot(f"before_dataloader_micro_{micro_idx}")
                 batch = next(dl_iter)
-                _memory_debug_snapshot(f"after_dataloader_micro_{micro_idx}")
                 batch = preprocessor(batch)
-                _memory_debug_snapshot(f"after_preprocessor_micro_{micro_idx}")
 
                 # Generate LAM codes for latent_smol (only when head_mode=latent)
                 if lam_teacher is not None:
@@ -998,11 +964,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             output_dict = _merge_microbatch_output_dicts(microbatch_output_dicts)
         else:
-            _memory_debug_snapshot("before_dataloader")
             batch = next(dl_iter)
-            _memory_debug_snapshot("after_dataloader")
             batch = preprocessor(batch)
-            _memory_debug_snapshot("after_preprocessor")
 
             # Generate LAM codes for latent_smol (only when head_mode=latent)
             if lam_teacher is not None:
