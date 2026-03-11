@@ -132,13 +132,15 @@ def test_peft_training_params_are_fewer(policy_type, tmp_path):
     model_id = resolve_model_id_for_peft_training(policy_type)
 
     def dummy_update_policy(
-        train_metrics, policy, batch, optimizer, grad_clip_norm: float, accelerator, **kwargs
+        train_metrics, policy, dl_iter, preprocessor, optimizer, grad_clip_norm, accelerator, **kwargs
     ):
         params_total = sum(p.numel() for p in policy.parameters())
         params_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
 
         assert params_total > params_trainable
 
+        batch = preprocessor(next(dl_iter))
+        policy.forward(batch)
         return train_metrics, {}
 
     with patch("lerobot.scripts.lerobot_train.update_policy", dummy_update_policy):
