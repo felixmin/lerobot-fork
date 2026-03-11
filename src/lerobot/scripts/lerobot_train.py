@@ -64,10 +64,16 @@ def _merge_microbatch_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[s
     action_denominator = 0.0
     latent_samples = 0.0
     latent_denominator = 0.0
+    action_loss_numerator = 0.0
+    action_loss_denominator = 0.0
+    latent_loss_numerator = 0.0
+    latent_loss_denominator = 0.0
 
     for output_dict in output_dicts:
         for key, value in output_dict.items():
             if key.startswith("_"):
+                continue
+            if key in {"action_loss", "latent_loss"}:
                 continue
             if isinstance(value, (int, float)):
                 output_sums[key] = output_sums.get(key, 0.0) + float(value)
@@ -76,8 +82,20 @@ def _merge_microbatch_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[s
         action_denominator += float(output_dict.get("_action_supervised_denominator", 0.0))
         latent_samples += float(output_dict.get("batch_latent_supervised_samples", 0.0))
         latent_denominator += float(output_dict.get("_latent_supervised_denominator", 0.0))
+        action_loss_denom_local = float(output_dict.get("_action_loss_denominator_exact", 0.0))
+        latent_loss_denom_local = float(output_dict.get("_latent_loss_denominator_exact", 0.0))
+        if "action_loss" in output_dict and action_loss_denom_local > 0.0:
+            action_loss_numerator += float(output_dict["action_loss"]) * action_loss_denom_local
+            action_loss_denominator += action_loss_denom_local
+        if "latent_loss" in output_dict and latent_loss_denom_local > 0.0:
+            latent_loss_numerator += float(output_dict["latent_loss"]) * latent_loss_denom_local
+            latent_loss_denominator += latent_loss_denom_local
 
     merged.update({k: output_sums[k] / max(1, output_counts[k]) for k in output_sums})
+    if action_loss_denominator > 0.0:
+        merged["action_loss"] = action_loss_numerator / action_loss_denominator
+    if latent_loss_denominator > 0.0:
+        merged["latent_loss"] = latent_loss_numerator / latent_loss_denominator
     if action_denominator > 0.0:
         merged["batch_action_supervised_samples"] = action_samples
         merged["batch_action_supervised_denominator"] = action_denominator
@@ -123,6 +141,54 @@ def _format_supervision_batch_log(output_dict: dict[str, Any] | None) -> str | N
     if not parts:
         return None
     return "batch_sup " + " ".join(parts)
+
+
+def _gather_accumulation_denominator_totals(
+    *,
+    accelerator: Accelerator,
+    action_total: float,
+    latent_total: float,
+) -> tuple[float, float]:
+    totals = torch.tensor(
+        [action_total, latent_total],
+        device=accelerator.device,
+        dtype=torch.float32,
+    )
+    gathered = accelerator.gather(totals)
+    if gathered.ndim == 1:
+        return float(gathered[0].item()), float(gathered[1].item())
+    summed = gathered.reshape(-1, 2).sum(dim=0)
+    return float(summed[0].item()), float(summed[1].item())
+
+
+def _build_exact_scaled_loss(
+    *,
+    output_dict: dict[str, Any],
+    action_total: float,
+    latent_total: float,
+    action_weight: float,
+    latent_weight: float,
+) -> torch.Tensor:
+    scaled_loss: torch.Tensor | None = None
+
+    action_loss = output_dict.get("_action_loss_tensor")
+    action_denom = float(output_dict.get("_action_loss_denominator_exact", 0.0))
+    if isinstance(action_loss, torch.Tensor) and action_denom > 0.0 and action_total > 0.0:
+        scaled_loss = action_loss * (action_weight * action_denom / action_total)
+
+    latent_loss = output_dict.get("_latent_loss_tensor")
+    latent_denom = float(output_dict.get("_latent_loss_denominator_exact", 0.0))
+    if isinstance(latent_loss, torch.Tensor) and latent_denom > 0.0 and latent_total > 0.0:
+        term = latent_loss * (latent_weight * latent_denom / latent_total)
+        scaled_loss = term if scaled_loss is None else (scaled_loss + term)
+
+    if scaled_loss is None:
+        for key in ("_action_loss_tensor", "_latent_loss_tensor"):
+            tensor = output_dict.get(key)
+            if isinstance(tensor, torch.Tensor):
+                return tensor * 0.0
+        raise RuntimeError("Exact accumulation requested but no supervised loss terms were available.")
+    return scaled_loss
 
 
 def _compute_loss_and_output_dict(
@@ -173,54 +239,98 @@ def update_policy(
     policy.train()
     optimizer.zero_grad()
 
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    supports_exact_accumulation = all(
+        has_method(unwrapped_policy, name)
+        for name in ("begin_training_step", "end_training_step", "get_accumulation_denominators")
+    )
+
     dataloading_total_s = 0.0
+    prefetched_batches: list[Any] = []
+    prefetched_denominators: list[dict[str, float]] = []
     microbatch_output_dicts: list[dict[str, Any]] = []
-    loss_sum = 0.0
+    logged_loss_value = 0.0
     grad_norm_value = 0.0
 
     accum_steps = max(1, int(accelerator.gradient_accumulation_steps))
-    for _ in range(accum_steps):
-        data_start = time.perf_counter()
-        batch = next(dl_iter)
-        batch = preprocessor(batch)
-        dataloading_total_s += time.perf_counter() - data_start
+    if supports_exact_accumulation:
+        unwrapped_policy.begin_training_step()
+    try:
+        for _ in range(accum_steps):
+            data_start = time.perf_counter()
+            batch = next(dl_iter)
+            batch = preprocessor(batch)
+            dataloading_total_s += time.perf_counter() - data_start
+            prefetched_batches.append(batch)
+            if supports_exact_accumulation:
+                prefetched_denominators.append(unwrapped_policy.get_accumulation_denominators(batch))
 
-        with accelerator.accumulate(policy):
-            loss, output_dict_local = _compute_loss_and_output_dict(
-                policy,
-                batch,
-                accelerator=accelerator,
-                rabc_weights_provider=rabc_weights_provider,
-            )
-            loss_sum += float(loss.item())
-            accelerator.backward(loss)
+        action_total = 0.0
+        latent_total = 0.0
+        if supports_exact_accumulation:
+            action_total = sum(item["action"] for item in prefetched_denominators)
+            latent_total = sum(item["latent"] for item in prefetched_denominators)
+            if accelerator.num_processes > 1:
+                action_total, latent_total = _gather_accumulation_denominator_totals(
+                    accelerator=accelerator,
+                    action_total=action_total,
+                    latent_total=latent_total,
+                )
 
-            if accelerator.sync_gradients:
-                if grad_clip_norm > 0:
-                    grad_norm = accelerator.clip_grad_norm_(
-                        policy.parameters(), grad_clip_norm
+        total_loss_value = 0.0
+        for batch in prefetched_batches:
+            with accelerator.accumulate(policy):
+                loss, output_dict_local = _compute_loss_and_output_dict(
+                    policy,
+                    batch,
+                    accelerator=accelerator,
+                    rabc_weights_provider=rabc_weights_provider,
+                )
+                if supports_exact_accumulation:
+                    scaled_loss = _build_exact_scaled_loss(
+                        output_dict=output_dict_local,
+                        action_total=action_total,
+                        latent_total=latent_total,
+                        action_weight=float(getattr(unwrapped_policy.config, "action_loss_weight", 1.0)),
+                        latent_weight=float(getattr(unwrapped_policy.config, "latent_loss_weight", 1.0)),
                     )
+                    total_loss_value += float(scaled_loss.detach().item())
+                    accelerator.backward(scaled_loss)
                 else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), float("inf"), error_if_nonfinite=False
-                    )
-                grad_norm_value = float(grad_norm.item())
-                optimizer.step()
-                optimizer.zero_grad()
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
-                if has_method(
-                    accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"
-                ):
-                    accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+                    total_loss_value += float(loss.item())
+                    accelerator.backward(loss)
 
-        if output_dict_local:
-            microbatch_output_dicts.append(output_dict_local)
+                if accelerator.sync_gradients:
+                    if grad_clip_norm > 0:
+                        grad_norm = accelerator.clip_grad_norm_(
+                            policy.parameters(), grad_clip_norm
+                        )
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            policy.parameters(), float("inf"), error_if_nonfinite=False
+                        )
+                    grad_norm_value = float(grad_norm.item())
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                    if has_method(unwrapped_policy, "update"):
+                        unwrapped_policy.update()
 
-    if not accelerator.sync_gradients:
-        raise RuntimeError("Gradient accumulation window ended without an optimizer step.")
+            if output_dict_local:
+                stored_output_dict = dict(output_dict_local)
+                stored_output_dict.pop("_action_loss_tensor", None)
+                stored_output_dict.pop("_latent_loss_tensor", None)
+                microbatch_output_dicts.append(stored_output_dict)
 
-    train_metrics.loss = loss_sum / float(accum_steps)
+        if not accelerator.sync_gradients:
+            raise RuntimeError("Gradient accumulation window ended without an optimizer step.")
+        logged_loss_value = total_loss_value if supports_exact_accumulation else (total_loss_value / float(accum_steps))
+    finally:
+        if supports_exact_accumulation:
+            unwrapped_policy.end_training_step()
+
+    train_metrics.loss = logged_loss_value
     train_metrics.grad_norm = grad_norm_value
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
