@@ -20,9 +20,7 @@ from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
-import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: N812
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -54,7 +52,6 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
-from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
 
 def _sanitize_output_dict_for_logging(output_dict: dict[str, Any] | None) -> dict[str, Any]:
@@ -242,135 +239,6 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, _sanitize_output_dict_for_logging(output_dict)
-
-
-def _to_uint8_hwc(img_chw: torch.Tensor) -> np.ndarray:
-    """Convert an image tensor [C,H,W] in [0,1] or [-1,1] to uint8 HWC."""
-    img = img_chw.detach().float().cpu()
-    if img.ndim != 3:
-        raise ValueError(f"Expected [C,H,W], got {tuple(img.shape)}")
-
-    if img.min().item() < 0.0:
-        img = (img + 1.0) / 2.0
-    img = img.clamp(0.0, 1.0)
-    img_hwc = img.permute(1, 2, 0).numpy()
-    return (img_hwc * 255.0).round().astype(np.uint8)
-
-
-def _decode_instructions(
-    tokenizer: Any | None,
-    token_ids: torch.Tensor | None,
-    attn_mask: torch.Tensor | None,
-    num_samples: int,
-) -> list[str]:
-    if tokenizer is None or token_ids is None:
-        return [""] * num_samples
-
-    token_ids_cpu = token_ids[:num_samples].detach().cpu()
-    mask_cpu = (
-        attn_mask[:num_samples].detach().cpu().bool() if attn_mask is not None else None
-    )
-
-    texts: list[str] = []
-    for i in range(token_ids_cpu.shape[0]):
-        ids = token_ids_cpu[i]
-        if mask_cpu is not None and mask_cpu.ndim == 2:
-            ids = ids[mask_cpu[i]]
-        texts.append(tokenizer.decode(ids.tolist(), skip_special_tokens=True).strip())
-    while len(texts) < num_samples:
-        texts.append("")
-    return texts
-
-
-def _build_lam_viz_table(
-    cfg: TrainPipelineConfig,
-    batch: dict[str, Any],
-    output_dict: dict[str, Any],
-    tokenizer: Any | None,
-    wandb: Any,
-    step: int,
-) -> Any:
-    """Create a small W&B table for LAM latent pretraining debugging."""
-    num_samples = int(max(1, getattr(cfg, "lam_viz_num_samples", 4)))
-
-    # Instruction text
-    lang_tokens = batch.get(OBS_LANGUAGE_TOKENS)
-    lang_mask = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
-    instructions = _decode_instructions(
-        tokenizer, lang_tokens, lang_mask, num_samples=num_samples
-    )
-
-    # Images: (t=0, t=Δ) pair from lam_camera_key
-    camera_key = (
-        getattr(cfg.policy, "lam_camera_key", None) if cfg.policy is not None else None
-    )
-    frames = batch.get(camera_key) if camera_key else None
-    images: list[Any] = []
-    if isinstance(frames, torch.Tensor) and frames.ndim == 5:
-        frames_t = frames[:num_samples]
-        # Handle both [B, 2, C, H, W] and [B, 2, H, W, C]
-        if frames_t.shape[-1] == 3:
-            frames_t = frames_t.permute(0, 1, 4, 2, 3)
-        if frames_t.shape[2] == 3 and frames_t.shape[1] >= 2:
-            frames_cpu = frames_t.detach().cpu()
-            for i in range(frames_cpu.shape[0]):
-                img0 = _to_uint8_hwc(frames_cpu[i, 0])
-                img1 = _to_uint8_hwc(frames_cpu[i, 1])
-                images.append(wandb.Image(np.concatenate([img0, img1], axis=1)))
-
-    # GT + predicted codes
-    gt_codes_t = batch.get("lam_codes")
-    valid_pair_t = batch.get("lam_valid_pair")
-    logits_t = output_dict.get("_logits")
-
-    gt_codes = (
-        gt_codes_t[:num_samples].detach().cpu().long().tolist()
-        if isinstance(gt_codes_t, torch.Tensor) and gt_codes_t.ndim >= 2
-        else [
-            [-1] * int(getattr(cfg.policy, "lam_code_seq_len", 4))
-            for _ in range(num_samples)
-        ]
-    )
-    valid_pair = (
-        valid_pair_t[:num_samples].detach().cpu().bool().tolist()
-        if isinstance(valid_pair_t, torch.Tensor) and valid_pair_t.ndim == 1
-        else [True] * num_samples
-    )
-
-    pred_codes: list[list[int]] = [[-1] * len(gt_codes[0]) for _ in range(num_samples)]
-    confidences: list[float] = [0.0 for _ in range(num_samples)]
-    if isinstance(logits_t, torch.Tensor) and logits_t.ndim == 3:
-        logits_cpu = logits_t[:num_samples].detach().cpu().float()  # [N, S, K]
-        pred = logits_cpu.argmax(dim=-1)  # [N, S]
-        pred_codes = pred.long().tolist()
-        probs = torch.softmax(logits_cpu, dim=-1)  # [N, S, K]
-        conf = probs.max(dim=-1).values.mean(dim=-1)  # [N]
-        confidences = conf.detach().cpu().tolist()
-
-    table = wandb.Table(
-        columns=[
-            "step",
-            "instruction",
-            "image_pair_t0_tΔ",
-            "gt_codes",
-            "pred_codes",
-            "valid_pair",
-            "mean_confidence",
-        ]
-    )
-
-    for i in range(num_samples):
-        img_cell = images[i] if i < len(images) else None
-        table.add_data(
-            step,
-            instructions[i],
-            img_cell,
-            str(gt_codes[i]),
-            str(pred_codes[i]),
-            bool(valid_pair[i]),
-            float(confidences[i]),
-        )
-    return table
 
 
 def get_default_peft_configuration(policy_type):
@@ -678,46 +546,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             device=device,
         )
 
-    # Initialize LAM teacher for latent_smol in latent mode
-    lam_teacher = None
-    if (
-        cfg.policy.type == "latent_smol"
-        and getattr(cfg.policy, "head_mode", "action") == "latent"
-    ):
-        from lerobot.teachers.lam_teacher import LAMTeacher, LAMTeacherConfig
-
-        if cfg.policy.lam_checkpoint_path is None:
-            raise ValueError("lam_checkpoint_path required for head_mode='latent'")
-
-        lam_teacher = LAMTeacher(
-            LAMTeacherConfig(
-                checkpoint_path=cfg.policy.lam_checkpoint_path,
-                device=str(device),
-            )
-        )
-        lam_teacher.eval()
-        if is_main_process:
-            logging.info(
-                f"LAM Teacher: K={lam_teacher.codebook_size}, S={lam_teacher.code_seq_len}"
-            )
-
-    lam_viz_enabled = (
-        is_main_process
-        and wandb_logger is not None
-        and int(getattr(cfg, "lam_viz_freq", 0)) > 0
-        and cfg.policy.type == "latent_smol"
-        and getattr(cfg.policy, "head_mode", "action") == "latent"
-    )
-    lam_viz_wandb = wandb_logger._wandb if wandb_logger is not None else None
-    lam_viz_tokenizer = None
-    if lam_viz_enabled:
-        try:
-            # Cache the tokenizer once (used only for visualization)
-            lam_viz_tokenizer = policy.model.vlm_with_expert.processor.tokenizer
-        except Exception as e:
-            logging.warning(f"LAM viz enabled but tokenizer lookup failed: {e}")
-            lam_viz_tokenizer = None
-
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -800,13 +628,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         policy.train()
 
         next_step = step + 1
-        lam_viz_due = (
-            lam_viz_enabled
-            and lam_viz_wandb is not None
-            and next_step % int(getattr(cfg, "lam_viz_freq", 0)) == 0
-        )
-        lam_viz_table = None
-
         dataloading_total_s = 0.0
         output_dict = {}
 
@@ -820,68 +641,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 data_start = time.perf_counter()
                 batch = next(dl_iter)
                 batch = preprocessor(batch)
-
-                # Generate LAM codes for latent_smol (only when head_mode=latent)
-                if lam_teacher is not None:
-                    from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
-
-                    # Disable autocast to avoid fp16/bf16 surprises with LAM
-                    with (
-                        torch.no_grad(),
-                        torch.autocast(device_type=device.type, enabled=False),
-                    ):
-                        camera_key = cfg.policy.lam_camera_key
-                        if camera_key not in batch:
-                            image_keys = sorted(
-                                [
-                                    k
-                                    for k in batch.keys()
-                                    if k.startswith("observation.images.")
-                                ]
-                            )
-                            raise KeyError(
-                                f"LAM teacher camera key '{camera_key}' not found in batch. "
-                                f"Available image keys: {image_keys}. "
-                                "Set --policy.lam_camera_key=<one of the available image keys>."
-                            )
-                        frames = batch[camera_key]
-
-                        # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
-                        if frames.shape[-1] == 3:  # [B, 2, H, W, C]
-                            frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
-                        assert (
-                            frames.shape[2] == 3
-                        ), f"Expected C=3, got shape {frames.shape}"
-
-                        # Default is_pad on same device as frames
-                        is_pad = batch.get(
-                            f"{camera_key}_is_pad",
-                            torch.zeros(
-                                frames.shape[:2], dtype=torch.bool, device=frames.device
-                            ),
-                        )
-
-                        valid_pair = valid_pair_from_is_pad(is_pad)
-
-                        # Resize to LAM input size (use reshape for non-contiguous safety)
-                        B, T, C, H, W = frames.shape
-                        resize_hw = cfg.policy.lam_resize_hw
-                        frames_flat = frames.reshape(B * T, C, H, W)
-                        frames_resized = F.interpolate(
-                            frames_flat,
-                            size=resize_hw,
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        frames = frames_resized.reshape(B, T, C, *resize_hw)
-
-                        # frames already on device after preprocessor (DeviceProcessorStep)
-                        codes = lam_teacher.codes_from_pair(frames)  # [B, 4]
-
-                        batch["lam_codes"] = codes
-                        batch["lam_valid_pair"] = valid_pair.to(
-                            codes.device
-                        )  # Ensure same device
 
                 dataloading_total_s += time.perf_counter() - data_start
 
@@ -915,20 +674,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         ]
                     else:
                         loss, output_dict_local = policy.forward(batch)
-
-                if lam_viz_due and lam_viz_table is None:
-                    try:
-                        lam_viz_table = _build_lam_viz_table(
-                            cfg=cfg,
-                            batch=batch,
-                            output_dict=output_dict_local,
-                            tokenizer=lam_viz_tokenizer,
-                            wandb=lam_viz_wandb,
-                            step=next_step,
-                        )
-                    except Exception as e:
-                        logging.warning(f"Failed to build LAM viz table: {e}")
-                        lam_viz_table = None
 
                 loss_sum += float(loss.item())
                 accelerator.backward(loss / grad_accum_steps)
@@ -967,68 +712,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             batch = next(dl_iter)
             batch = preprocessor(batch)
 
-            # Generate LAM codes for latent_smol (only when head_mode=latent)
-            if lam_teacher is not None:
-                from lerobot.teachers.lam_teacher import valid_pair_from_is_pad
-
-                # Disable autocast to avoid fp16/bf16 surprises with LAM
-                with (
-                    torch.no_grad(),
-                    torch.autocast(device_type=device.type, enabled=False),
-                ):
-                    camera_key = cfg.policy.lam_camera_key
-                    if camera_key not in batch:
-                        image_keys = sorted(
-                            [
-                                k
-                                for k in batch.keys()
-                                if k.startswith("observation.images.")
-                            ]
-                        )
-                        raise KeyError(
-                            f"LAM teacher camera key '{camera_key}' not found in batch. "
-                            f"Available image keys: {image_keys}. "
-                            "Set --policy.lam_camera_key=<one of the available image keys>."
-                        )
-                    frames = batch[camera_key]
-
-                    # Handle both [B, 2, C, H, W] and [B, 2, H, W, C] layouts
-                    if frames.shape[-1] == 3:  # [B, 2, H, W, C]
-                        frames = frames.permute(0, 1, 4, 2, 3)  # -> [B, 2, C, H, W]
-                    assert (
-                        frames.shape[2] == 3
-                    ), f"Expected C=3, got shape {frames.shape}"
-
-                    # Default is_pad on same device as frames
-                    is_pad = batch.get(
-                        f"{camera_key}_is_pad",
-                        torch.zeros(
-                            frames.shape[:2], dtype=torch.bool, device=frames.device
-                        ),
-                    )
-
-                    valid_pair = valid_pair_from_is_pad(is_pad)
-
-                    # Resize to LAM input size (use reshape for non-contiguous safety)
-                    B, T, C, H, W = frames.shape
-                    resize_hw = cfg.policy.lam_resize_hw
-                    frames_flat = frames.reshape(B * T, C, H, W)
-                    frames_resized = F.interpolate(
-                        frames_flat,
-                        size=resize_hw,
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    frames = frames_resized.reshape(B, T, C, *resize_hw)
-
-                    # frames already on device after preprocessor (DeviceProcessorStep)
-                    codes = lam_teacher.codes_from_pair(frames)  # [B, 4]
-
-                    batch["lam_codes"] = codes
-                    batch["lam_valid_pair"] = valid_pair.to(
-                        codes.device
-                    )  # Ensure same device
-
             train_tracker.dataloading_s = time.perf_counter() - start_time
 
             train_tracker, output_dict = update_policy(
@@ -1042,26 +725,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 rabc_weights_provider=rabc_weights,
             )
 
-            if lam_viz_due and lam_viz_table is None:
-                try:
-                    lam_viz_table = _build_lam_viz_table(
-                        cfg=cfg,
-                        batch=batch,
-                        output_dict=output_dict,
-                        tokenizer=lam_viz_tokenizer,
-                        wandb=lam_viz_wandb,
-                        step=next_step,
-                    )
-                except Exception as e:
-                    logging.warning(f"Failed to build LAM viz table: {e}")
-                    lam_viz_table = None
-
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
         train_tracker.step()
-        if lam_viz_table is not None and lam_viz_wandb is not None:
-            lam_viz_wandb.log({"train/lam_viz": lam_viz_table}, step=step)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
