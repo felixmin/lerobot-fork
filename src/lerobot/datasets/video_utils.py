@@ -141,6 +141,18 @@ def decode_video_frames_torchvision(
     query_ts = torch.tensor(timestamps)
     loaded_ts = torch.tensor(loaded_ts)
 
+    if loaded_ts.numel() == 0:
+        raise RuntimeError(
+            "Video decode returned no frames for the requested timestamp window."
+            f"\nvideo: {video_path}"
+            f"\nbackend: {backend}"
+            f"\ntolerance_s: {tolerance_s}"
+            f"\nqueried timestamps: {query_ts}"
+            f"\nfirst_ts: {first_ts}"
+            f"\nlast_ts: {last_ts}"
+            "\nThis usually indicates a dataset/video timestamp mismatch or a bad/corrupt video file."
+        )
+
     # compute distances between each query timestamp and timestamps of all loaded frames
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
