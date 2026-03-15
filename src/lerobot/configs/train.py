@@ -56,6 +56,7 @@ class TrainPipelineConfig(HubMixin):
     # Gradient accumulation steps. Effective batch size per optimizer update is:
     # batch_size * grad_accum_steps * num_processes.
     grad_accum_steps: int = 1
+    distributed_timeout_s: float | None = None
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
@@ -137,6 +138,9 @@ class TrainPipelineConfig(HubMixin):
         elif self.use_policy_training_preset and not self.resume:
             self.optimizer = self.policy.get_optimizer_preset()
             self.scheduler = self.policy.get_scheduler_preset()
+
+        if self.distributed_timeout_s is not None and self.distributed_timeout_s <= 0:
+            raise ValueError("distributed_timeout_s must be > 0 when provided.")
 
         if self.policy.push_to_hub and not self.policy.repo_id:
             raise ValueError(
