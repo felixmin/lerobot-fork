@@ -47,6 +47,7 @@ class TrainPipelineConfig(HubMixin):
     # Note that when resuming a run, the default behavior is to use the configuration from the checkpoint,
     # regardless of what's provided with the training command at the time of resumption.
     resume: bool = False
+    resume_config_path: Path | None = None
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -92,7 +93,11 @@ class TrainPipelineConfig(HubMixin):
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
             # The entire train config is already loaded, we just need to get the checkpoint dir
-            config_path = parser.parse_arg("config_path")
+            config_path = (
+                str(self.resume_config_path)
+                if self.resume_config_path is not None
+                else parser.parse_arg("config_path")
+            )
             if not config_path:
                 raise ValueError(
                     f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
