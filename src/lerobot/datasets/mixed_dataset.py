@@ -38,12 +38,17 @@ class DatasetMixSourceConfig:
     supervision: str = "multitask"
     video_backend: str | None = None
     tolerance_s: float | None = None
+    feature_key_mapping: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
 class DatasetMixConfig:
     path: Path
     sources: tuple[DatasetMixSourceConfig, ...]
+    retained_features: tuple[str, ...] | None = None
+    enforce_matching_fps: bool = True
+    enforce_matching_delta_timestamps: bool = True
+    allow_visual_shape_mismatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,8 @@ class MixedSourceMetadata:
     video_backend: str | None
     tolerance_s: float
     num_frames: int
+    feature_key_mapping: dict[str, str]
+    retained_features: tuple[str, ...] | None
 
 
 @dataclass
@@ -120,11 +127,142 @@ def _parse_episode_list(
     return tuple(sorted(values))
 
 
+def _parse_string_list(
+    *,
+    field_name: str,
+    values: list[str] | None,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise TypeError(f"Expected '{field_name}' to be a list of strings.")
+    parsed: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError(f"Expected '{field_name}' to contain only strings.")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(f"Expected '{field_name}' to contain non-empty strings.")
+        parsed.append(cleaned)
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"Expected '{field_name}' to contain unique strings.")
+    return tuple(parsed)
+
+
+def _parse_bool_field(*, field_name: str, value: bool | None, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise TypeError(f"Expected '{field_name}' to be a boolean.")
+    return value
+
+
+def _parse_feature_key_mapping(
+    *,
+    field_name: str,
+    value: dict[str, str] | None,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"Expected '{field_name}' to be a mapping of strings.")
+
+    mapping: dict[str, str] = {}
+    for raw_source_key, raw_target_key in value.items():
+        if not isinstance(raw_source_key, str) or not isinstance(raw_target_key, str):
+            raise TypeError(
+                f"Expected '{field_name}' to map string keys to string values."
+            )
+        source_key = raw_source_key.strip()
+        target_key = raw_target_key.strip()
+        if not source_key or not target_key:
+            raise ValueError(
+                f"Expected '{field_name}' to map non-empty strings, got "
+                f"{raw_source_key!r}->{raw_target_key!r}."
+            )
+        mapping[source_key] = target_key
+
+    inverse: dict[str, str] = {}
+    for source_key, target_key in mapping.items():
+        previous_source = inverse.get(target_key)
+        if previous_source is not None and previous_source != source_key:
+            raise ValueError(
+                f"Expected '{field_name}' to be one-to-one, but target key "
+                f"{target_key!r} is mapped from both {previous_source!r} and "
+                f"{source_key!r}."
+            )
+        inverse[target_key] = source_key
+    return mapping
+
+
+def _remap_output_key(key: str, feature_key_mapping: dict[str, str]) -> str:
+    if key in feature_key_mapping:
+        return feature_key_mapping[key]
+    suffix = "_is_pad"
+    if key.endswith(suffix):
+        base_key = key[: -len(suffix)]
+        if base_key in feature_key_mapping:
+            return f"{feature_key_mapping[base_key]}{suffix}"
+    return key
+
+
+def _remap_top_level_dict(
+    data: dict[str, Any],
+    feature_key_mapping: dict[str, str] | None,
+    *,
+    source_name: str,
+    field_name: str,
+) -> dict[str, Any]:
+    mapping = feature_key_mapping or {}
+    remapped: dict[str, Any] = {}
+    for key, value in data.items():
+        target_key = mapping.get(key, key)
+        if target_key in remapped:
+            raise ValueError(
+                f"Feature remapping for source '{source_name}' causes duplicate "
+                f"{field_name} key {target_key!r}."
+            )
+        remapped[target_key] = deepcopy(value)
+    return remapped
+
+
+def _filter_top_level_dict(
+    data: dict[str, Any],
+    retained_keys: tuple[str, ...] | None,
+) -> dict[str, Any]:
+    if retained_keys is None:
+        return deepcopy(data)
+    retained = set(retained_keys)
+    return {key: deepcopy(value) for key, value in data.items() if key in retained}
+
+
+def _feature_signature(
+    features: dict[str, dict[str, Any]],
+    *,
+    allow_visual_shape_mismatch: bool,
+) -> dict[str, dict[str, Any]]:
+    signature: dict[str, dict[str, Any]] = {}
+    for key, feature in features.items():
+        entry = deepcopy(feature)
+        if allow_visual_shape_mismatch and entry.get("dtype") in {"image", "video"}:
+            entry = {"dtype": "visual"}
+        signature[key] = entry
+    return signature
+
+
 def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
     mix_path = Path(path).expanduser().resolve()
     payload = yaml.safe_load(mix_path.read_text())
     if not isinstance(payload, dict):
         raise ValueError(f"Expected mix config '{mix_path}' to contain a mapping.")
+
+    raw_compatibility = payload.get("compatibility")
+    if raw_compatibility is None:
+        raw_compatibility = {}
+    if not isinstance(raw_compatibility, dict):
+        raise TypeError(
+            f"Expected mix config '{mix_path}' compatibility field to be a mapping."
+        )
 
     raw_sources = payload.get("sources")
     if not isinstance(raw_sources, list) or len(raw_sources) == 0:
@@ -172,6 +310,10 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
                 if raw_source.get("tolerance_s") is None
                 else float(raw_source["tolerance_s"])
             ),
+            feature_key_mapping=_parse_feature_key_mapping(
+                field_name="feature_key_mapping",
+                value=raw_source.get("feature_key_mapping"),
+            ),
         )
         if source.name in seen_names:
             raise ValueError(f"Duplicate mix source name '{source.name}'.")
@@ -186,7 +328,29 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
         seen_names.add(source.name)
         sources.append(source)
 
-    return DatasetMixConfig(path=mix_path, sources=tuple(sources))
+    return DatasetMixConfig(
+        path=mix_path,
+        sources=tuple(sources),
+        retained_features=_parse_string_list(
+            field_name="compatibility.retained_features",
+            values=raw_compatibility.get("retained_features"),
+        ),
+        enforce_matching_fps=_parse_bool_field(
+            field_name="compatibility.enforce_matching_fps",
+            value=raw_compatibility.get("enforce_matching_fps"),
+            default=True,
+        ),
+        enforce_matching_delta_timestamps=_parse_bool_field(
+            field_name="compatibility.enforce_matching_delta_timestamps",
+            value=raw_compatibility.get("enforce_matching_delta_timestamps"),
+            default=True,
+        ),
+        allow_visual_shape_mismatch=_parse_bool_field(
+            field_name="compatibility.allow_visual_shape_mismatch",
+            value=raw_compatibility.get("allow_visual_shape_mismatch"),
+            default=False,
+        ),
+    )
 
 
 def _selected_episodes(
@@ -461,16 +625,80 @@ class LogicalSource:
         image_transforms: Any = None,
         default_tolerance_s: float = 1e-4,
         shared_dataset_cache: dict[tuple[Any, ...], LeRobotDataset] | None = None,
+        retained_features: tuple[str, ...] | None = None,
     ) -> None:
         self.source_index = int(source_index)
         self.config = config
         self.meta = meta
-        self.delta_timestamps = deepcopy(delta_timestamps)
+        self.feature_key_mapping = deepcopy(config.feature_key_mapping or {})
+        self.retained_features = retained_features
+        self.raw_delta_timestamps = deepcopy(delta_timestamps)
+        self.delta_timestamps = _remap_top_level_dict(
+            delta_timestamps or {},
+            self.feature_key_mapping,
+            source_name=config.name,
+            field_name="delta_timestamps",
+        )
+        if delta_timestamps is None:
+            self.delta_timestamps = None
         self.image_transforms = image_transforms
         self.selected_episodes = _selected_episodes(config, meta.total_episodes)
         self.index = _build_source_index(meta, self.selected_episodes)
-        self.features = deepcopy(meta.features)
-        self.stats = _aggregate_selected_stats(meta, self.selected_episodes)
+        unknown_feature_keys = sorted(
+            key for key in self.feature_key_mapping if key not in meta.features
+        )
+        if unknown_feature_keys:
+            raise ValueError(
+                f"Feature remapping for source '{config.name}' references unknown "
+                f"feature keys: {unknown_feature_keys}"
+            )
+        remapped_features = _remap_top_level_dict(
+            meta.features,
+            self.feature_key_mapping,
+            source_name=config.name,
+            field_name="features",
+        )
+        remapped_stats = _remap_top_level_dict(
+            _aggregate_selected_stats(meta, self.selected_episodes),
+            self.feature_key_mapping,
+            source_name=config.name,
+            field_name="stats",
+        )
+        if self.retained_features is not None:
+            missing_retained = sorted(
+                key for key in self.retained_features if key not in remapped_features
+            )
+            if missing_retained:
+                raise ValueError(
+                    f"Source '{config.name}' is missing retained features "
+                    f"{missing_retained} after remapping."
+                )
+        self._all_feature_keys = set(remapped_features)
+        self.features = _filter_top_level_dict(remapped_features, self.retained_features)
+        self.stats = _filter_top_level_dict(remapped_stats, self.retained_features)
+        self.delta_timestamps = _filter_top_level_dict(
+            self.delta_timestamps or {},
+            self.retained_features,
+        )
+        if self.retained_features is not None:
+            inverse_mapping = {
+                target_key: source_key
+                for source_key, target_key in self.feature_key_mapping.items()
+            }
+            raw_retained_features = tuple(
+                inverse_mapping.get(feature_key, feature_key)
+                for feature_key in self.retained_features
+            )
+        else:
+            raw_retained_features = None
+        self.raw_delta_timestamps = _filter_top_level_dict(
+            self.raw_delta_timestamps or {},
+            raw_retained_features,
+        )
+        if delta_timestamps is None or len(self.delta_timestamps) == 0:
+            self.delta_timestamps = None
+        if delta_timestamps is None or len(self.raw_delta_timestamps) == 0:
+            self.raw_delta_timestamps = None
         self.tolerance_s = float(
             default_tolerance_s if config.tolerance_s is None else config.tolerance_s
         )
@@ -556,6 +784,8 @@ class LogicalSource:
             video_backend=self.config.video_backend,
             tolerance_s=self.tolerance_s,
             num_frames=self.num_frames,
+            feature_key_mapping=deepcopy(self.feature_key_mapping),
+            retained_features=self.retained_features,
         )
 
     def _get_dataset(self) -> LeRobotDataset:
@@ -565,7 +795,7 @@ class LogicalSource:
             self.revision,
             self.config.video_backend,
             float(self.tolerance_s),
-            repr(self.delta_timestamps),
+            repr(self.raw_delta_timestamps),
             id(self.image_transforms),
         )
         dataset = self._shared_dataset_cache.get(cache_key)
@@ -575,7 +805,7 @@ class LogicalSource:
                 root=self.meta.root,
                 episodes=None,
                 image_transforms=self.image_transforms,
-                delta_timestamps=self.delta_timestamps,
+                delta_timestamps=self.raw_delta_timestamps,
                 revision=self.revision,
                 video_backend=self.config.video_backend,
                 tolerance_s=self.tolerance_s,
@@ -601,6 +831,26 @@ class LogicalSource:
             )
 
         item = dataset[relative_index]
+        if self.feature_key_mapping:
+            remapped_item: dict[str, Any] = {}
+            for key, value in item.items():
+                target_key = _remap_output_key(key, self.feature_key_mapping)
+                if target_key in remapped_item:
+                    raise ValueError(
+                        f"Feature remapping for source '{self.name}' causes duplicate "
+                        f"item key {target_key!r}."
+                    )
+                remapped_item[target_key] = value
+            item = remapped_item
+        if self.retained_features is not None:
+            retained = set(self.retained_features)
+            filtered_item: dict[str, Any] = {}
+            for key, value in item.items():
+                base_key = key[: -len("_is_pad")] if key.endswith("_is_pad") else key
+                if base_key in self._all_feature_keys and base_key not in retained:
+                    continue
+                filtered_item[key] = value
+            item = filtered_item
         item["hlrp_action_supervised"] = torch.tensor(
             self.action_supervised, dtype=torch.bool
         )
@@ -661,6 +911,12 @@ def _build_mixed_info(
             "video_backend": metadata.video_backend,
             "tolerance_s": metadata.tolerance_s,
             "num_frames": metadata.num_frames,
+            "feature_key_mapping": deepcopy(metadata.feature_key_mapping),
+            "retained_features": (
+                None
+                if metadata.retained_features is None
+                else list(metadata.retained_features)
+            ),
         }
         for metadata in (source.metadata() for source in sources)
     ]
@@ -669,12 +925,21 @@ def _build_mixed_info(
     return info
 
 
-def validate_mixed_sources(sources: list[LogicalSource]) -> None:
+def validate_mixed_sources(
+    sources: list[LogicalSource],
+    *,
+    enforce_matching_fps: bool = True,
+    enforce_matching_delta_timestamps: bool = True,
+    allow_visual_shape_mismatch: bool = False,
+) -> None:
     if len(sources) == 0:
         raise ValueError("Expected at least one logical source.")
 
     base_source = sources[0]
-    base_features = base_source.features
+    base_feature_signature = _feature_signature(
+        base_source.features,
+        allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+    )
     base_fps = base_source.meta.fps
     base_delta_timestamps = base_source.delta_timestamps
     base_camera_keys = base_source.camera_keys
@@ -684,13 +949,22 @@ def validate_mixed_sources(sources: list[LogicalSource]) -> None:
     for source in sources:
         if source.num_frames <= 0:
             raise ValueError(f"Mix source '{source.name}' resolved to zero frames.")
-        if source.meta.fps != base_fps:
+        if enforce_matching_fps and source.meta.fps != base_fps:
             raise ValueError("All mix sources must have matching fps.")
-        if source.features != base_features:
+        if (
+            _feature_signature(
+                source.features,
+                allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+            )
+            != base_feature_signature
+        ):
             raise ValueError("All mix sources must have identical feature schemas.")
         if source.camera_keys != base_camera_keys:
             raise ValueError("All mix sources must expose the same camera keys.")
-        if source.delta_timestamps != base_delta_timestamps:
+        if (
+            enforce_matching_delta_timestamps
+            and source.delta_timestamps != base_delta_timestamps
+        ):
             raise ValueError(
                 "All mix sources must resolve to identical delta timestamps."
             )
@@ -717,9 +991,17 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
         logical_repo_id: str,
         mix_path: str | Path,
         sources: list[LogicalSource],
+        enforce_matching_fps: bool = True,
+        enforce_matching_delta_timestamps: bool = True,
+        allow_visual_shape_mismatch: bool = False,
     ) -> None:
         super().__init__()
-        validate_mixed_sources(sources)
+        validate_mixed_sources(
+            sources,
+            enforce_matching_fps=enforce_matching_fps,
+            enforce_matching_delta_timestamps=enforce_matching_delta_timestamps,
+            allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+        )
         self.repo_id = logical_repo_id
         self.mix_path = str(Path(mix_path).expanduser().resolve())
         self.sources = list(sources)

@@ -58,15 +58,21 @@ def resolve_delta_timestamps(
             }
             returns `None` if the resulting dict is empty.
     """
+    observation_delta_indices = cfg.observation_delta_indices
+    if hasattr(cfg, "get_observation_delta_indices_for_fps"):
+        observation_delta_indices = cfg.get_observation_delta_indices_for_fps(
+            ds_meta.fps
+        )
+
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+        if key.startswith(OBS_PREFIX) and observation_delta_indices is not None:
             delta_timestamps[key] = [
-                i / ds_meta.fps for i in cfg.observation_delta_indices
+                i / ds_meta.fps for i in observation_delta_indices
             ]
 
     if len(delta_timestamps) == 0:
@@ -131,6 +137,7 @@ def make_dataset(
                     image_transforms=image_transforms,
                     default_tolerance_s=cfg.tolerance_s,
                     shared_dataset_cache=shared_dataset_cache,
+                    retained_features=mix_cfg.retained_features,
                 )
             )
 
@@ -138,6 +145,9 @@ def make_dataset(
             logical_repo_id=cfg.dataset.repo_id,
             mix_path=mix_cfg.path,
             sources=sources,
+            enforce_matching_fps=mix_cfg.enforce_matching_fps,
+            enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
+            allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
         )
     elif isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
