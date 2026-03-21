@@ -36,6 +36,7 @@ class EvalPipelineConfig:
     output_dir: Path | None = None
     job_name: str | None = None
     seed: int | None = 1000
+    max_episodes_rendered: int = 10
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     # Explicit consent to execute remote code from the Hub (required for hub environments).
