@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import yaml
 
 from lerobot.datasets.compute_stats import aggregate_stats
@@ -249,6 +250,52 @@ def _feature_signature(
             entry = {"dtype": "visual"}
         signature[key] = entry
     return signature
+
+
+def _normalize_visual_target_size(
+    value: tuple[int, int] | list[int] | None,
+) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if len(value) != 2:
+        raise ValueError("Expected visual target size to have exactly two dimensions.")
+    height, width = int(value[0]), int(value[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("Expected visual target size to be strictly positive.")
+    return (height, width)
+
+
+def _resize_visual_tensor(
+    tensor: torch.Tensor,
+    target_size: tuple[int, int],
+) -> torch.Tensor:
+    if tensor.ndim < 3:
+        return tensor
+
+    current_size = tuple(int(dim) for dim in tensor.shape[-2:])
+    if current_size == target_size:
+        return tensor
+
+    if tensor.shape[-3] not in {1, 3}:
+        return tensor
+
+    original_dtype = tensor.dtype
+    leading_shape = tuple(int(dim) for dim in tensor.shape[:-3])
+    channels = int(tensor.shape[-3])
+    work = tensor.reshape(-1, channels, *current_size)
+    if not work.is_floating_point():
+        work = work.to(torch.float32)
+    resized = F.interpolate(
+        work,
+        size=target_size,
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    )
+    resized = resized.reshape(*leading_shape, channels, *target_size)
+    if resized.dtype != original_dtype:
+        resized = resized.to(original_dtype)
+    return resized
 
 
 def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
@@ -627,6 +674,7 @@ class LogicalSource:
         default_tolerance_s: float = 1e-4,
         shared_dataset_cache: dict[tuple[Any, ...], LeRobotDataset] | None = None,
         retained_features: tuple[str, ...] | None = None,
+        visual_target_size: tuple[int, int] | list[int] | None = None,
     ) -> None:
         self.source_index = int(source_index)
         self.config = config
@@ -643,6 +691,7 @@ class LogicalSource:
         if delta_timestamps is None:
             self.delta_timestamps = None
         self.image_transforms = image_transforms
+        self.visual_target_size = _normalize_visual_target_size(visual_target_size)
         self.selected_episodes = _selected_episodes(config, meta.total_episodes)
         self.index = _build_source_index(meta, self.selected_episodes)
         unknown_feature_keys = sorted(
@@ -852,6 +901,14 @@ class LogicalSource:
                     continue
                 filtered_item[key] = value
             item = filtered_item
+        if self.visual_target_size is not None:
+            for key, value in list(item.items()):
+                feature = self.features.get(key)
+                if feature is None or feature.get("dtype") not in {"image", "video"}:
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    continue
+                item[key] = _resize_visual_tensor(value, self.visual_target_size)
         item["hlrp_action_supervised"] = torch.tensor(
             self.action_supervised, dtype=torch.bool
         )

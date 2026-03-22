@@ -104,6 +104,7 @@ def make_dataset(
             raise ValueError("Mixed datasets do not support streaming mode.")
 
         mix_cfg = load_dataset_mix_config(cfg.dataset.mix_path)
+        visual_target_size = getattr(cfg.policy, "image_size", None)
         sources = []
         shared_dataset_cache = {}
         for source_index, source_cfg in enumerate(mix_cfg.sources):
@@ -136,6 +137,7 @@ def make_dataset(
                     default_tolerance_s=cfg.tolerance_s,
                     shared_dataset_cache=shared_dataset_cache,
                     retained_features=mix_cfg.retained_features,
+                    visual_target_size=visual_target_size,
                 )
             )
 
