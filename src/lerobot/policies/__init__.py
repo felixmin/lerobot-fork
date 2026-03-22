@@ -20,10 +20,6 @@ from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .smolvla.processor_smolvla import SmolVLANewLineProcessor
-# Register latent_smol config with draccus ChoiceRegistry
-from .latent_smol.configuration_latent_smol import LatentSmolConfig as LatentSmolConfig  # noqa: F401
-# Register latent_smol processor steps (needed to resume runs that load processors from checkpoints)
-from .latent_smol.processor_latent_smol import LatentSmolNewLineProcessor  # noqa: F401
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig

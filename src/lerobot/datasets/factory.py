@@ -114,18 +114,6 @@ def make_dataset(
                 revision=source_cfg.revision,
             )
 
-            if (
-                getattr(cfg.policy, "type", None) == "latent_smol"
-                and getattr(cfg.policy, "head_mode", None) == "latent"
-                and getattr(cfg.policy, "lam_future_frames", 0) <= 0
-            ):
-                cfg.policy.lam_future_frames = max(
-                    1, round(source_meta.fps * cfg.policy.lam_future_seconds)
-                )
-                logging.info(
-                    f"Computed lam_future_frames={cfg.policy.lam_future_frames} (fps={source_meta.fps})"
-                )
-
             source_delta_timestamps = resolve_delta_timestamps(cfg.policy, source_meta)
             sources.append(
                 LogicalSource(
@@ -153,19 +141,6 @@ def make_dataset(
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-
-        # Compute lam_future_frames for latent_smol in latent mode before resolving delta timestamps
-        if (
-            getattr(cfg.policy, "type", None) == "latent_smol"
-            and getattr(cfg.policy, "head_mode", None) == "latent"
-            and getattr(cfg.policy, "lam_future_frames", 0) <= 0
-        ):
-            cfg.policy.lam_future_frames = max(
-                1, round(ds_meta.fps * cfg.policy.lam_future_seconds)
-            )
-            logging.info(
-                f"Computed lam_future_frames={cfg.policy.lam_future_frames} (fps={ds_meta.fps})"
-            )
 
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:

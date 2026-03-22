@@ -131,10 +131,6 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
-    elif name == "latent_smol":
-        from lerobot.policies.latent_smol.modeling_latent_smol import LatentSmolPolicy
-
-        return LatentSmolPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -349,15 +345,6 @@ def make_pre_post_processors(
         from lerobot.policies.sac.reward_model.processor_classifier import make_classifier_processor
 
         processors = make_classifier_processor(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-
-    elif getattr(policy_cfg, "type", None) == "latent_smol":
-        # Must check by type before SmolVLAConfig since latent_smol config inherits SmolVLAConfig.
-        from lerobot.policies.latent_smol.processor_latent_smol import make_latent_smol_pre_post_processors
-
-        processors = make_latent_smol_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
