@@ -99,6 +99,48 @@ def _write_mix_config(path: Path, dataset_root: Path, *, overlap: bool = False) 
     return path
 
 
+def _write_three_source_mix_config(path: Path, dataset_root: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [
+                    {
+                        "name": "source_a",
+                        "repo_id": "local/stage3",
+                        "root": str(dataset_root),
+                        "weight": 1.0,
+                        "episodes": [0],
+                        "supervision": "multitask",
+                        "video_backend": "pyav",
+                        "tolerance_s": 0.0001,
+                    },
+                    {
+                        "name": "source_b",
+                        "repo_id": "local/stage3",
+                        "root": str(dataset_root),
+                        "weight": 1.0,
+                        "episodes": [1],
+                        "supervision": "multitask",
+                        "video_backend": "pyav",
+                        "tolerance_s": 0.0001,
+                    },
+                    {
+                        "name": "source_c",
+                        "repo_id": "local/stage3",
+                        "root": str(dataset_root),
+                        "weight": 1.0,
+                        "exclude_episodes": [0, 1],
+                        "supervision": "multitask",
+                        "video_backend": "pyav",
+                        "tolerance_s": 0.0001,
+                    },
+                ]
+            }
+        )
+    )
+    return path
+
+
 def _make_cfg(
     mix_path: Path,
     *,
@@ -248,6 +290,24 @@ def test_compact_manifest_dataset_collates_mixed_batches(tmp_path):
     assert batch["observation.state_is_pad"].dtype == torch.bool
     assert batch["action_is_pad"].dtype == torch.bool
     assert isinstance(batch["dataset_source_name"], list)
+
+
+def test_compact_manifest_default_runtime_cache_scales_with_active_sources(tmp_path):
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", [3, 3, 4, 4]
+    )
+    mix_path = _write_three_source_mix_config(tmp_path / "mix_three.yaml", dataset_root)
+    dataset = make_dataset(
+        _make_cfg(
+            mix_path,
+            mix_impl="compact_manifest",
+            mix_max_sources_per_batch=2,
+        )
+    )
+
+    assert isinstance(dataset, CompactMixedDataset)
+    assert len(dataset.sources) == 3
+    assert dataset.max_open_datasets_per_worker == 3
 
 
 def test_mixed_dataset_collates_supervision_and_source_metadata(tmp_path):

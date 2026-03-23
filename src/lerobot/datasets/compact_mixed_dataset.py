@@ -4,8 +4,11 @@ from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
+import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -33,6 +36,8 @@ from lerobot.datasets.mixed_dataset import (
     build_explicit_mixed_stats,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _default_max_open_datasets_per_worker() -> int:
     raw = os.environ.get("HLRP_MIXED_MAX_OPEN_DATASETS_PER_WORKER", "").strip()
@@ -44,6 +49,56 @@ def _default_max_open_datasets_per_worker() -> int:
         raise ValueError(
             "HLRP_MIXED_MAX_OPEN_DATASETS_PER_WORKER must be an integer when set."
         ) from exc
+
+
+def _resolve_max_open_datasets_per_worker(
+    *,
+    num_sources: int,
+    max_sources_per_batch: int | None,
+    configured: int | None,
+) -> int:
+    if configured is not None:
+        return max(1, int(configured))
+
+    env_default = _default_max_open_datasets_per_worker()
+    batch_cap = None if max_sources_per_batch in {None, 0} else int(max_sources_per_batch)
+    heuristic_default = (
+        min(int(num_sources), 4)
+        if batch_cap is None
+        else min(int(num_sources), max(2, batch_cap * 2))
+    )
+    return max(env_default, heuristic_default)
+
+
+def _compact_profile_enabled() -> bool:
+    return os.environ.get("HLRP_COMPACT_PROFILE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _compact_profile_every() -> int:
+    raw = os.environ.get("HLRP_COMPACT_PROFILE_EVERY", "").strip()
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(
+            "HLRP_COMPACT_PROFILE_EVERY must be an integer when set."
+        ) from exc
+
+
+def _compact_profile_prefix() -> str:
+    worker = torch.utils.data.get_worker_info()
+    worker_id = -1 if worker is None else int(worker.id)
+    return f"[compact-profile pid={os.getpid()} worker={worker_id}]"
+
+
+def _compact_profile_log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -77,6 +132,7 @@ class SampleToken:
 class CompactSourceRuntime:
     dataset: LeRobotDataset
     compiled_index: CompiledSourceIndex
+    open_count: int = 1
 
 
 class WeightedSampleIndexSampler(torch.utils.data.Sampler[SampleToken]):
@@ -326,6 +382,7 @@ class CompactSourceAdapter:
             default_tolerance_s if config.tolerance_s is None else config.tolerance_s
         )
         self.compiled_index = self._compile_index(drop_n_last_frames=0)
+        self._profile_fetch_many_calls = 0
 
     @property
     def name(self) -> str:
@@ -537,18 +594,29 @@ class CompactSourceAdapter:
         *,
         anchor_abs_indices: Sequence[int],
     ) -> list[dict[str, Any]]:
+        profile = _compact_profile_enabled()
+        profile_every = _compact_profile_every() if profile else 0
+        self._profile_fetch_many_calls += 1
+        profile_this_call = profile and (
+            self._profile_fetch_many_calls % profile_every == 0
+        )
+        started = time.perf_counter() if profile_this_call else 0.0
         if len(anchor_abs_indices) == 0:
             return []
         if len(anchor_abs_indices) == 1:
             return [self.fetch_one(dataset, anchor_abs_index=int(anchor_abs_indices[0]))]
 
+        t_before_ensure = time.perf_counter() if profile_this_call else 0.0
         dataset._ensure_hf_dataset_loaded()
+        t_after_ensure = time.perf_counter() if profile_this_call else 0.0
         records: list[dict[str, Any]] = []
+        relative_indices: list[int] = []
         for anchor_abs_index in anchor_abs_indices:
             if dataset._absolute_to_relative_idx is None:
                 relative_index = int(anchor_abs_index)
             else:
                 relative_index = int(dataset._absolute_to_relative_idx[int(anchor_abs_index)])
+            relative_indices.append(relative_index)
 
             item = dict(dataset.hf_dataset[relative_index])
             ep_idx = int(item["episode_index"].item())
@@ -570,6 +638,7 @@ class CompactSourceAdapter:
                     ),
                 }
             )
+        t_after_plan = time.perf_counter() if profile_this_call else 0.0
 
         if dataset.delta_indices is not None:
             non_video_query_indices: dict[str, list[int]] = {}
@@ -597,6 +666,7 @@ class CompactSourceAdapter:
                         record["item"][key] = non_video_results[key][start:stop]
                         key_offsets[key] = stop
                     record["item"].update(record["padding"])
+        t_after_nonvisual = time.perf_counter() if profile_this_call else 0.0
 
         if dataset.meta.video_keys:
             video_requests: dict[int, dict[str, list[tuple[int, int]]]] = {}
@@ -617,6 +687,7 @@ class CompactSourceAdapter:
                         stop = start + count
                         records[record_index]["item"][key] = decoded[start:stop].squeeze(0)
                         start = stop
+        t_after_video = time.perf_counter() if profile_this_call else 0.0
 
         items: list[dict[str, Any]] = []
         for record in records:
@@ -631,6 +702,28 @@ class CompactSourceAdapter:
                 subtask_idx = item["subtask_index"].item()
                 item["subtask"] = dataset.meta.subtasks.iloc[subtask_idx].name
             items.append(self._adapt_item(item))
+        t_after_assemble = time.perf_counter() if profile_this_call else 0.0
+
+        if profile_this_call:
+            unique_eps = len({int(record["ep_idx"]) for record in records})
+            query_sizes = [
+                sum(len(ts) for ts in record["query_timestamps"].values())
+                for record in records
+            ]
+            _compact_profile_log(
+                (
+                    f"{_compact_profile_prefix()} source={self.name} anchors={len(anchor_abs_indices)} "
+                    f"unique_eps={unique_eps} rel_idx_span="
+                    f"{f'{min(relative_indices)}..{max(relative_indices)}' if relative_indices else 'NA'} "
+                    f"ensure_s={t_after_ensure - t_before_ensure:.3f} "
+                    f"plan_s={t_after_plan - t_after_ensure:.3f} "
+                    f"nonvisual_s={t_after_nonvisual - t_after_plan:.3f} "
+                    f"video_s={t_after_video - t_after_nonvisual:.3f} "
+                    f"assemble_s={t_after_assemble - t_after_video:.3f} "
+                    f"total_s={t_after_assemble - started:.3f} "
+                    f"avg_queries_per_item={0.0 if len(query_sizes) == 0 else float(np.mean(query_sizes)):.1f}"
+                )
+            )
 
         return items
 
@@ -818,17 +911,18 @@ class CompactMixedDataset(torch.utils.data.Dataset):
         )
         self.episodes = None
         self.manifest = _build_manifest(self.sources)
-        self.max_open_datasets_per_worker = (
-            _default_max_open_datasets_per_worker()
-            if max_open_datasets_per_worker is None
-            else max(1, int(max_open_datasets_per_worker))
-        )
         self.max_sources_per_batch = (
             None
             if max_sources_per_batch in {None, 0}
             else max(1, int(max_sources_per_batch))
         )
+        self.max_open_datasets_per_worker = _resolve_max_open_datasets_per_worker(
+            num_sources=len(self.sources),
+            max_sources_per_batch=self.max_sources_per_batch,
+            configured=max_open_datasets_per_worker,
+        )
         self._source_runtimes: OrderedDict[int, CompactSourceRuntime] = OrderedDict()
+        self._profile_batch_calls = 0
         virtual_episodes = _build_compact_virtual_episodes(self.sources)
 
         self.meta = MixedLeRobotDatasetMetadata(
@@ -904,6 +998,7 @@ class CompactMixedDataset(torch.utils.data.Dataset):
         return source_index, source_local_index
 
     def _get_source_runtime(self, source_index: int) -> CompactSourceRuntime:
+        profile = _compact_profile_enabled()
         runtime = self._source_runtimes.pop(source_index, None)
         if runtime is None:
             source = self.sources[source_index]
@@ -911,9 +1006,25 @@ class CompactMixedDataset(torch.utils.data.Dataset):
                 dataset=source.make_dataset(),
                 compiled_index=source.compiled_index,
             )
+            if profile:
+                _compact_profile_log(
+                    (
+                        f"{_compact_profile_prefix()} runtime_open source={source.name} "
+                        f"cache_size_before={len(self._source_runtimes)} "
+                        f"max_open={self.max_open_datasets_per_worker}"
+                    )
+                )
         self._source_runtimes[source_index] = runtime
         while len(self._source_runtimes) > self.max_open_datasets_per_worker:
-            self._source_runtimes.popitem(last=False)
+            evicted_index, _ = self._source_runtimes.popitem(last=False)
+            if profile:
+                _compact_profile_log(
+                    (
+                        f"{_compact_profile_prefix()} runtime_evict "
+                        f"source={self.sources[int(evicted_index)].name} "
+                        f"cache_size_after={len(self._source_runtimes)}"
+                    )
+                )
         return runtime
 
     def _fetch_token(self, token: SampleToken) -> dict[str, Any]:
@@ -938,6 +1049,13 @@ class CompactMixedDataset(torch.utils.data.Dataset):
         return self._fetch_one(index)
 
     def __getitems__(self, indices: Sequence[int | SampleToken]) -> list[dict[str, Any]]:
+        profile = _compact_profile_enabled()
+        profile_every = _compact_profile_every() if profile else 0
+        self._profile_batch_calls += 1
+        profile_this_call = profile and (
+            self._profile_batch_calls % profile_every == 0
+        )
+        started = time.perf_counter() if profile_this_call else 0.0
         grouped_requests: dict[int, list[tuple[int, int | SampleToken]]] = {}
         ordered: list[dict[str, Any] | None] = [None] * len(indices)
         for batch_pos, sample_index in enumerate(indices):
@@ -952,9 +1070,12 @@ class CompactMixedDataset(torch.utils.data.Dataset):
                 grouped_requests.setdefault(source_index, []).append(
                     (batch_pos, source_local_index)
                 )
+        grouped_at = time.perf_counter() if profile_this_call else 0.0
 
+        per_source_stats: list[str] = []
         for source_index, requests in grouped_requests.items():
             source = self.sources[source_index]
+            source_started = time.perf_counter() if profile_this_call else 0.0
             runtime = self._get_source_runtime(source_index)
             anchors: list[int] = []
             for _, request_payload in requests:
@@ -962,13 +1083,33 @@ class CompactMixedDataset(torch.utils.data.Dataset):
                     anchors.append(int(request_payload.anchor_abs_index))
                 else:
                     anchors.append(source.flat_index_to_anchor(int(request_payload)))
+            anchors_ready = time.perf_counter() if profile_this_call else 0.0
             items = source.fetch_many(runtime.dataset, anchor_abs_indices=anchors)
+            fetched_at = time.perf_counter() if profile_this_call else 0.0
             for (batch_pos, _), item in zip(requests, items, strict=True):
                 ordered[batch_pos] = item
+            if profile_this_call:
+                per_source_stats.append(
+                    (
+                        f"{source.name}:n={len(requests)} prep={anchors_ready - source_started:.3f}s "
+                        f"fetch={fetched_at - anchors_ready:.3f}s"
+                    )
+                )
 
         if any(item is None for item in ordered):
             raise RuntimeError(
                 "CompactMixedDataset.__getitems__ failed to populate every requested index."
+            )
+        if profile_this_call:
+            finished = time.perf_counter()
+            _compact_profile_log(
+                (
+                    f"{_compact_profile_prefix()} batch={self._profile_batch_calls} "
+                    f"size={len(indices)} groups={len(grouped_requests)} "
+                    f"group_s={grouped_at - started:.3f} total_s={finished - started:.3f} "
+                    f"cache={[self.sources[idx].name for idx in self._source_runtimes.keys()]} "
+                    f"per_source=[{'; '.join(per_source_stats)}]"
+                )
             )
         return [item for item in ordered if item is not None]
 
