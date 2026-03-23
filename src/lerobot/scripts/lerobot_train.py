@@ -457,16 +457,19 @@ def make_offline_dataloader(
     drop_n_last_frames = int(getattr(cfg.policy, "drop_n_last_frames", 0))
     sampler = None
     shuffle = True
-    # Mixed datasets are much more sensitive to source churn and in-flight worker pressure.
-    is_mixed_dataset = hasattr(dataset, "sources")
+    loader_hints = dataset.loader_hints() if has_method(dataset, "loader_hints") else {}
+    is_mixed_dataset = bool(loader_hints.get("is_mixed", False))
+    prefetch_factor = int(loader_hints.get("prefetch_factor", 2))
 
     if hasattr(dataset, "build_sampler"):
         sampler_kwargs = dict(
             seed=0 if cfg.seed is None else int(cfg.seed),
             drop_n_last_frames=drop_n_last_frames,
         )
-        if is_mixed_dataset:
+        if loader_hints.get("sampler_mode") == "source_block":
             sampler_kwargs["source_block_size"] = max(1, int(cfg.batch_size))
+        if loader_hints.get("pass_batch_size_to_sampler"):
+            sampler_kwargs["batch_size"] = max(1, int(cfg.batch_size))
         sampler = dataset.build_sampler(**sampler_kwargs)
         shuffle = False
     elif hasattr(cfg.policy, "drop_n_last_frames"):
@@ -487,7 +490,7 @@ def make_offline_dataloader(
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=(1 if is_mixed_dataset else 2) if cfg.num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if cfg.num_workers > 0 else None,
     )
 
 

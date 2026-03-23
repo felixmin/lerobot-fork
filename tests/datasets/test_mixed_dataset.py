@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from lerobot.configs.default import DatasetConfig
+from lerobot.datasets.compact_mixed_dataset import CompactMixedDataset
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mixed_dataset import (
@@ -98,9 +99,19 @@ def _write_mix_config(path: Path, dataset_root: Path, *, overlap: bool = False) 
     return path
 
 
-def _make_cfg(mix_path: Path) -> SimpleNamespace:
+def _make_cfg(
+    mix_path: Path,
+    *,
+    mix_impl: str = "current",
+    mix_max_sources_per_batch: int | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        dataset=DatasetConfig(repo_id="logical/stage3_mix", mix_path=str(mix_path)),
+        dataset=DatasetConfig(
+            repo_id="logical/stage3_mix",
+            mix_path=str(mix_path),
+            mix_impl=mix_impl,
+            mix_max_sources_per_batch=mix_max_sources_per_batch,
+        ),
         policy=SimpleNamespace(
             reward_delta_indices=None,
             action_delta_indices=None,
@@ -190,6 +201,53 @@ def test_make_dataset_routes_mix_path_and_stamps_supervision(tmp_path):
     assert multitask_item["hlrp_source_name"] == "multitask_source"
     assert multitask_item["dataset_source_name"] == "multitask_source"
     assert multitask_item["dataset_source_root"] == str(dataset_root)
+
+
+def test_make_dataset_routes_compact_manifest_as_selectable_alternate(tmp_path):
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", [3, 3, 4, 4]
+    )
+    mix_path = _write_mix_config(tmp_path / "mix.yaml", dataset_root)
+
+    dataset = make_dataset(_make_cfg(mix_path, mix_impl="compact_manifest"))
+
+    assert isinstance(dataset, CompactMixedDataset)
+    assert dataset.loader_hints()["mixed_impl"] == "compact_manifest"
+    assert len(dataset) == dataset.num_frames == int(dataset.meta.info["total_frames"])
+    assert dataset.num_episodes == int(dataset.meta.info["total_episodes"])
+
+    batch_items = dataset.__getitems__([0, 1, 2])
+    assert len(batch_items) == 3
+    assert [item["dataset_source_name"] for item in batch_items] == [
+        item["hlrp_source_name"] for item in batch_items
+    ]
+
+
+def test_compact_manifest_dataset_collates_mixed_batches(tmp_path):
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", [3, 3, 4, 4]
+    )
+    mix_path = _write_mix_config(tmp_path / "mix.yaml", dataset_root)
+    dataset = make_dataset(
+        _make_cfg(
+            mix_path,
+            mix_impl="compact_manifest",
+            mix_max_sources_per_batch=2,
+        )
+    )
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=3,
+        num_workers=0,
+        sampler=dataset.build_sampler(seed=11, batch_size=3),
+    )
+    batch = next(iter(dataloader))
+
+    assert batch["hlrp_action_supervised"].dtype == torch.bool
+    assert batch["observation.state_is_pad"].dtype == torch.bool
+    assert batch["action_is_pad"].dtype == torch.bool
+    assert isinstance(batch["dataset_source_name"], list)
 
 
 def test_mixed_dataset_collates_supervision_and_source_metadata(tmp_path):

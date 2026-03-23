@@ -1124,6 +1124,14 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
     def features(self) -> dict[str, dict[str, Any]]:
         return self.meta.features
 
+    def loader_hints(self) -> dict[str, Any]:
+        return {
+            "is_mixed": True,
+            "prefetch_factor": 1,
+            "sampler_mode": "source_block",
+            "mixed_impl": "current",
+        }
+
     def __len__(self) -> int:
         return self.num_frames
 
