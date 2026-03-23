@@ -27,7 +27,6 @@ def _debug_mixed_dataset() -> bool:
     value = os.environ.get("HLRP_STAGE3_DEBUG_DATASET", "")
     return value.lower() in {"1", "true", "yes", "on"}
 
-
 @dataclass(frozen=True)
 class DatasetMixSourceConfig:
     name: str
@@ -195,6 +194,27 @@ def _parse_feature_key_mapping(
             )
         inverse[target_key] = source_key
     return mapping
+
+
+def _infer_required_lookahead_frames(
+    delta_timestamps: dict[str, list[float]] | None,
+    *,
+    fps: int | float,
+) -> int:
+    if not delta_timestamps:
+        return 0
+
+    max_positive_seconds = 0.0
+    for timestamps in delta_timestamps.values():
+        for timestamp in timestamps:
+            max_positive_seconds = max(max_positive_seconds, float(timestamp))
+
+    if max_positive_seconds <= 0.0:
+        return 0
+
+    # Delta timestamps are resolved from integer frame offsets in the standard
+    # LeRobot path, so rounding back to frames is the least surprising inverse.
+    return max(0, int(round(max_positive_seconds * float(fps))))
 
 
 def _remap_output_key(key: str, feature_key_mapping: dict[str, str]) -> str:
@@ -749,6 +769,10 @@ class LogicalSource:
             self.delta_timestamps = None
         if delta_timestamps is None or len(self.raw_delta_timestamps) == 0:
             self.raw_delta_timestamps = None
+        self.required_lookahead_frames = _infer_required_lookahead_frames(
+            self.raw_delta_timestamps,
+            fps=self.meta.fps,
+        )
         self.tolerance_s = float(
             default_tolerance_s if config.tolerance_s is None else config.tolerance_s
         )
@@ -809,7 +833,10 @@ class LogicalSource:
         return (self.repo_id, str(Path(self.meta.root).resolve()), self.revision)
 
     def get_effective_lengths(self, drop_n_last_frames: int = 0) -> np.ndarray:
-        return np.maximum(self.index.lengths - int(drop_n_last_frames), 0)
+        total_drop_n_last_frames = int(drop_n_last_frames) + int(
+            self.required_lookahead_frames
+        )
+        return np.maximum(self.index.lengths - total_drop_n_last_frames, 0)
 
     def flat_index_to_anchor(self, index: int, *, drop_n_last_frames: int = 0) -> int:
         effective_lengths = self.get_effective_lengths(drop_n_last_frames)
@@ -908,7 +935,8 @@ class LogicalSource:
                     continue
                 if not isinstance(value, torch.Tensor):
                     continue
-                item[key] = _resize_visual_tensor(value, self.visual_target_size)
+                resized = _resize_visual_tensor(value, self.visual_target_size)
+                item[key] = resized
         item["hlrp_action_supervised"] = torch.tensor(
             self.action_supervised, dtype=torch.bool
         )
@@ -1120,7 +1148,11 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
         return self.sources[source_index].get_item(anchor_abs_index)
 
     def build_sampler(
-        self, *, seed: int | None = None, drop_n_last_frames: int = 0
+        self,
+        *,
+        seed: int | None = None,
+        drop_n_last_frames: int = 0,
+        source_block_size: int = 1,
     ) -> WeightedSourceSampler:
         num_samples = int(
             sum(
@@ -1138,4 +1170,5 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
             num_samples=num_samples,
             seed=0 if seed is None else int(seed),
             drop_n_last_frames=drop_n_last_frames,
+            source_block_size=source_block_size,
         )

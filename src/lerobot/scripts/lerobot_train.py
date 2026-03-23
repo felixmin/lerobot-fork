@@ -457,12 +457,17 @@ def make_offline_dataloader(
     drop_n_last_frames = int(getattr(cfg.policy, "drop_n_last_frames", 0))
     sampler = None
     shuffle = True
+    # Mixed datasets are much more sensitive to source churn and in-flight worker pressure.
+    is_mixed_dataset = hasattr(dataset, "sources")
 
     if hasattr(dataset, "build_sampler"):
-        sampler = dataset.build_sampler(
+        sampler_kwargs = dict(
             seed=0 if cfg.seed is None else int(cfg.seed),
             drop_n_last_frames=drop_n_last_frames,
         )
+        if is_mixed_dataset:
+            sampler_kwargs["source_block_size"] = max(1, int(cfg.batch_size))
+        sampler = dataset.build_sampler(**sampler_kwargs)
         shuffle = False
     elif hasattr(cfg.policy, "drop_n_last_frames"):
         sampler = EpisodeAwareSampler(
@@ -482,7 +487,7 @@ def make_offline_dataloader(
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=(1 if is_mixed_dataset else 2) if cfg.num_workers > 0 else None,
     )
 
 

@@ -112,12 +112,14 @@ class WeightedSourceSampler(torch.utils.data.Sampler[tuple[int, int]]):
         num_samples: int,
         seed: int,
         drop_n_last_frames: int = 0,
+        source_block_size: int = 1,
     ) -> None:
         self.sources = list(sources)
         self.source_weights = _normalize_weights(source_weights)
         self.num_samples = int(num_samples)
         self.seed = int(seed)
         self.drop_n_last_frames = int(drop_n_last_frames)
+        self.source_block_size = max(1, int(source_block_size))
         self._epoch = 0
 
     def __len__(self) -> int:
@@ -144,38 +146,43 @@ class WeightedSourceSampler(torch.utils.data.Sampler[tuple[int, int]]):
                 source_weights[source_index] = 0.0
         source_weights = _normalize_weights(source_weights)
 
+        # Draw sources in coarse blocks to reduce cross-source churn in multi-source loaders.
+        num_source_draws = (self.num_samples + self.source_block_size - 1) // self.source_block_size
         source_ids = torch.multinomial(
             torch.as_tensor(source_weights, dtype=torch.float64),
-            num_samples=self.num_samples,
+            num_samples=num_source_draws,
             replacement=True,
             generator=generator,
         ).tolist()
 
+        produced = 0
         for source_id in source_ids:
             lengths = effective_lengths[source_id]
             episode_weights = _normalize_weights(lengths.astype(np.float64))
-            episode_pos = int(
-                torch.multinomial(
-                    torch.as_tensor(episode_weights, dtype=torch.float64),
-                    num_samples=1,
-                    replacement=True,
-                    generator=generator,
-                ).item()
-            )
-            offset = int(
-                torch.randint(
-                    int(lengths[episode_pos]), size=(1,), generator=generator
-                ).item()
-            )
-            anchor = int(
-                self.sources[source_id].index.dataset_from_index[episode_pos] + offset
-            )
-            if _debug_sampler():
-                logger.info(
-                    "[sampler] source=%s episode=%s offset=%s anchor=%s",
-                    getattr(self.sources[source_id], "name", source_id),
-                    int(self.sources[source_id].index.episode_indices[episode_pos]),
-                    offset,
-                    anchor,
+            for _ in range(min(self.source_block_size, self.num_samples - produced)):
+                episode_pos = int(
+                    torch.multinomial(
+                        torch.as_tensor(episode_weights, dtype=torch.float64),
+                        num_samples=1,
+                        replacement=True,
+                        generator=generator,
+                    ).item()
                 )
-            yield int(source_id), anchor
+                offset = int(
+                    torch.randint(
+                        int(lengths[episode_pos]), size=(1,), generator=generator
+                    ).item()
+                )
+                anchor = int(
+                    self.sources[source_id].index.dataset_from_index[episode_pos] + offset
+                )
+                if _debug_sampler():
+                    logger.info(
+                        "[sampler] source=%s episode=%s offset=%s anchor=%s",
+                        getattr(self.sources[source_id], "name", source_id),
+                        int(self.sources[source_id].index.episode_indices[episode_pos]),
+                        offset,
+                        anchor,
+                    )
+                yield int(source_id), anchor
+                produced += 1

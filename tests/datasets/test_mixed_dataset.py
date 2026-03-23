@@ -110,6 +110,18 @@ def _make_cfg(mix_path: Path) -> SimpleNamespace:
     )
 
 
+def _make_cfg_with_observation_delta(mix_path: Path, observation_delta_indices: list[int]) -> SimpleNamespace:
+    return SimpleNamespace(
+        dataset=DatasetConfig(repo_id="logical/stage3_mix", mix_path=str(mix_path)),
+        policy=SimpleNamespace(
+            reward_delta_indices=None,
+            action_delta_indices=None,
+            observation_delta_indices=observation_delta_indices,
+        ),
+        tolerance_s=1e-4,
+    )
+
+
 def test_load_dataset_mix_config_supports_mix_path(tmp_path):
     dataset_root = _make_local_dataset(
         tmp_path / "dataset", "local/stage3", [3, 3, 4, 4]
@@ -257,6 +269,23 @@ def test_mixed_dataset_rejects_source_overlap(tmp_path):
 
     with pytest.raises(ValueError, match="cannot overlap"):
         make_dataset(_make_cfg(mix_path))
+
+
+def test_mixed_dataset_sampler_drops_source_lookahead_frames(tmp_path):
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", [5, 4, 4, 4]
+    )
+    mix_path = _write_mix_config(tmp_path / "mix.yaml", dataset_root)
+
+    dataset = make_dataset(_make_cfg_with_observation_delta(mix_path, [0, 2]))
+
+    latent_source = dataset.sources[0]
+    multitask_source = dataset.sources[1]
+
+    assert latent_source.required_lookahead_frames == 2
+    assert multitask_source.required_lookahead_frames == 2
+    assert latent_source.get_effective_lengths().tolist() == [3, 2]
+    assert multitask_source.get_effective_lengths().tolist() == [2, 2]
 
 
 def test_weighted_source_sampler_biases_towards_heavier_sources(tmp_path):
