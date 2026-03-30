@@ -15,6 +15,7 @@ import yaml
 
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.feature_utils import get_delta_indices
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import WeightedSourceSampler
 from lerobot.datasets.utils import flatten_dict, unflatten_dict
@@ -682,6 +683,24 @@ def build_explicit_mixed_stats(sources: list[Any]) -> dict[str, dict[str, np.nda
     return merge_weighted_stats(stats_by_source, source_weights)
 
 
+def _compute_delta_frame_bounds(
+    delta_timestamps: dict[str, list[float]] | None,
+    fps: int,
+) -> tuple[int, int]:
+    if not delta_timestamps:
+        return 0, 0
+
+    delta_indices = get_delta_indices(delta_timestamps, int(fps))
+    min_delta = 0
+    max_delta = 0
+    for deltas in delta_indices.values():
+        if not deltas:
+            continue
+        min_delta = min(min_delta, min(int(delta) for delta in deltas))
+        max_delta = max(max_delta, max(int(delta) for delta in deltas))
+    return max(0, -min_delta), max(0, max_delta)
+
+
 class LogicalSource:
     def __init__(
         self,
@@ -776,6 +795,10 @@ class LogicalSource:
         self.tolerance_s = float(
             default_tolerance_s if config.tolerance_s is None else config.tolerance_s
         )
+        self._drop_n_first_frames, self._drop_n_last_frames = _compute_delta_frame_bounds(
+            self.raw_delta_timestamps,
+            self.meta.fps,
+        )
         self._shared_dataset_cache = (
             {} if shared_dataset_cache is None else shared_dataset_cache
         )
@@ -833,10 +856,16 @@ class LogicalSource:
         return (self.repo_id, str(Path(self.meta.root).resolve()), self.revision)
 
     def get_effective_lengths(self, drop_n_last_frames: int = 0) -> np.ndarray:
-        total_drop_n_last_frames = int(drop_n_last_frames) + int(
-            self.required_lookahead_frames
+        trailing_drop = max(
+            int(self._drop_n_last_frames),
+            int(self.required_lookahead_frames),
         )
-        return np.maximum(self.index.lengths - total_drop_n_last_frames, 0)
+        total_drop = (
+            int(self._drop_n_first_frames)
+            + trailing_drop
+            + int(drop_n_last_frames)
+        )
+        return np.maximum(self.index.lengths - total_drop, 0)
 
     def flat_index_to_anchor(self, index: int, *, drop_n_last_frames: int = 0) -> int:
         effective_lengths = self.get_effective_lengths(drop_n_last_frames)
@@ -847,7 +876,11 @@ class LogicalSource:
         cumulative_lengths = np.cumsum(effective_lengths, dtype=np.int64)
         episode_pos = int(np.searchsorted(cumulative_lengths, index, side="right"))
         prev_total = 0 if episode_pos == 0 else int(cumulative_lengths[episode_pos - 1])
-        return int(self.index.dataset_from_index[episode_pos] + (index - prev_total))
+        return int(
+            self.index.dataset_from_index[episode_pos]
+            + int(self._drop_n_first_frames)
+            + (index - prev_total)
+        )
 
     def metadata(self) -> MixedSourceMetadata:
         return MixedSourceMetadata(
