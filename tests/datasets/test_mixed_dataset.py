@@ -144,15 +144,13 @@ def _write_three_source_mix_config(path: Path, dataset_root: Path) -> Path:
 def _make_cfg(
     mix_path: Path,
     *,
-    mix_impl: str = "current",
-    mix_max_sources_per_batch: int | None = None,
+    mix_implementation: str = "current",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         dataset=DatasetConfig(
             repo_id="logical/stage3_mix",
             mix_path=str(mix_path),
-            mix_impl=mix_impl,
-            mix_max_sources_per_batch=mix_max_sources_per_batch,
+            mix_implementation=mix_implementation,
         ),
         policy=SimpleNamespace(
             reward_delta_indices=None,
@@ -165,7 +163,11 @@ def _make_cfg(
 
 def _make_cfg_with_observation_delta(mix_path: Path, observation_delta_indices: list[int]) -> SimpleNamespace:
     return SimpleNamespace(
-        dataset=DatasetConfig(repo_id="logical/stage3_mix", mix_path=str(mix_path)),
+        dataset=DatasetConfig(
+            repo_id="logical/stage3_mix",
+            mix_path=str(mix_path),
+            mix_implementation="current",
+        ),
         policy=SimpleNamespace(
             reward_delta_indices=None,
             action_delta_indices=None,
@@ -181,7 +183,11 @@ def test_load_dataset_mix_config_supports_mix_path(tmp_path):
     )
     mix_path = _write_mix_config(tmp_path / "mix.yaml", dataset_root)
 
-    cfg = DatasetConfig(repo_id="logical/stage3_mix", mix_path=str(mix_path))
+    cfg = DatasetConfig(
+        repo_id="logical/stage3_mix",
+        mix_path=str(mix_path),
+        mix_implementation="current",
+    )
     mix_cfg = load_dataset_mix_config(cfg.mix_path)
 
     assert cfg.mix_path == str(mix_path)
@@ -251,7 +257,9 @@ def test_make_dataset_routes_compact_manifest_as_selectable_alternate(tmp_path):
     )
     mix_path = _write_mix_config(tmp_path / "mix.yaml", dataset_root)
 
-    dataset = make_dataset(_make_cfg(mix_path, mix_impl="compact_manifest"))
+    dataset = make_dataset(
+        _make_cfg(mix_path, mix_implementation="compact_manifest")
+    )
 
     assert isinstance(dataset, CompactMixedDataset)
     assert dataset.loader_hints()["mixed_impl"] == "compact_manifest"
@@ -273,8 +281,7 @@ def test_compact_manifest_dataset_collates_mixed_batches(tmp_path):
     dataset = make_dataset(
         _make_cfg(
             mix_path,
-            mix_impl="compact_manifest",
-            mix_max_sources_per_batch=2,
+            mix_implementation="compact_manifest",
         )
     )
 
@@ -300,8 +307,7 @@ def test_compact_manifest_default_runtime_cache_scales_with_active_sources(tmp_p
     dataset = make_dataset(
         _make_cfg(
             mix_path,
-            mix_impl="compact_manifest",
-            mix_max_sources_per_batch=2,
+            mix_implementation="compact_manifest",
         )
     )
 
@@ -387,6 +393,8 @@ def test_mixed_dataset_rejects_source_overlap(tmp_path):
 
     with pytest.raises(ValueError, match="cannot overlap"):
         make_dataset(_make_cfg(mix_path))
+
+
 
 
 def test_mixed_dataset_sampler_drops_source_lookahead_frames(tmp_path):

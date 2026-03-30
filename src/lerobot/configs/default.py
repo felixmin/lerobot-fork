@@ -30,10 +30,7 @@ class DatasetConfig:
     # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | None = None
     mix_path: str | None = None
-    mix_impl: str = "current"
-    mix_max_sources_per_batch: int | None = None
-    mix_implementation: str = "current"
-    mixed_resize_visuals_to_policy_image_size: bool = True
+    mix_implementation: str = "lerobot"
     episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(
         default_factory=ImageTransformsConfig
@@ -44,20 +41,6 @@ class DatasetConfig:
     streaming: bool = False
 
     def __post_init__(self) -> None:
-        if self.mix_impl not in {"current", "compact_manifest"}:
-            raise ValueError(
-                f"mix_impl must be one of ['compact_manifest', 'current'], got {self.mix_impl!r}"
-            )
-        if self.mix_max_sources_per_batch is not None and self.mix_max_sources_per_batch <= 0:
-            raise ValueError("mix_max_sources_per_batch must be > 0 when provided.")
-        if self.mix_implementation not in {"current", "legacy"}:
-            raise ValueError(
-                f"mix_implementation must be 'current' or 'legacy', got {self.mix_implementation!r}"
-            )
-        if self.mix_impl == "compact_manifest" and self.mix_implementation != "current":
-            raise ValueError(
-                "mix_implementation='legacy' is not supported with mix_impl='compact_manifest'."
-            )
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(

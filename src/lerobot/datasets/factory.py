@@ -113,17 +113,17 @@ def make_dataset(
         if cfg.dataset.image_transforms.enable
         else None
     )
+    mix_implementation = str(getattr(cfg.dataset, "mix_implementation", "lerobot"))
 
-    if cfg.dataset.mix_path is not None:
+    if mix_implementation != "lerobot":
         if cfg.dataset.streaming:
             raise ValueError("Mixed datasets do not support streaming mode.")
 
+        if cfg.dataset.mix_path is None:
+            raise ValueError("Mixed dataset implementations require dataset.mix_path.")
+
         mix_cfg = load_dataset_mix_config(cfg.dataset.mix_path)
-        visual_target_size = (
-            getattr(cfg.policy, "image_size", None)
-            if cfg.dataset.mixed_resize_visuals_to_policy_image_size
-            else None
-        )
+        visual_target_size = getattr(cfg.policy, "image_size", None)
         source_metas = []
         source_delta_timestamps = []
         for source_cfg in mix_cfg.sources:
@@ -135,7 +135,7 @@ def make_dataset(
             source_metas.append(source_meta)
             source_delta_timestamps.append(resolve_delta_timestamps(cfg.policy, source_meta))
 
-        if cfg.dataset.mix_impl == "compact_manifest":
+        if mix_implementation == "compact_manifest":
             sources = []
             for source_index, (source_cfg, source_meta, source_delta_timestamp) in enumerate(
                 zip(mix_cfg.sources, source_metas, source_delta_timestamps, strict=True)
@@ -160,53 +160,50 @@ def make_dataset(
                 enforce_matching_fps=mix_cfg.enforce_matching_fps,
                 enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
                 allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
-                max_sources_per_batch=cfg.dataset.mix_max_sources_per_batch,
+            )
+        elif mix_implementation == "legacy":
+            validate_legacy_mix_config(mix_cfg)
+            dataset = make_legacy_mixed_dataset(
+                logical_repo_id=cfg.dataset.repo_id,
+                mix_path=mix_cfg.path,
+                default_tolerance_s=cfg.tolerance_s,
+                image_transforms=image_transforms,
+                sources=mix_cfg.sources,
+                metadata_by_source=source_metas,
+                delta_timestamps_by_source=source_delta_timestamps,
+            )
+        elif mix_implementation == "current":
+            sources = []
+            shared_dataset_cache = {}
+            for source_index, (source_cfg, source_meta, source_delta_timestamp) in enumerate(
+                zip(mix_cfg.sources, source_metas, source_delta_timestamps, strict=True)
+            ):
+                sources.append(
+                    LogicalSource(
+                        source_index=source_index,
+                        config=source_cfg,
+                        meta=source_meta,
+                        delta_timestamps=source_delta_timestamp,
+                        image_transforms=image_transforms,
+                        default_tolerance_s=cfg.tolerance_s,
+                        shared_dataset_cache=shared_dataset_cache,
+                        retained_features=mix_cfg.retained_features,
+                        visual_target_size=visual_target_size,
+                    )
+                )
+
+            dataset = MixedLeRobotDataset(
+                logical_repo_id=cfg.dataset.repo_id,
+                mix_path=mix_cfg.path,
+                sources=sources,
+                enforce_matching_fps=mix_cfg.enforce_matching_fps,
+                enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
+                allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
             )
         else:
-            mix_implementation = str(getattr(cfg.dataset, "mix_implementation", "current"))
-            if mix_implementation == "legacy":
-                validate_legacy_mix_config(mix_cfg)
-                dataset = make_legacy_mixed_dataset(
-                    logical_repo_id=cfg.dataset.repo_id,
-                    mix_path=mix_cfg.path,
-                    default_tolerance_s=cfg.tolerance_s,
-                    image_transforms=image_transforms,
-                    sources=mix_cfg.sources,
-                    metadata_by_source=source_metas,
-                    delta_timestamps_by_source=source_delta_timestamps,
-                )
-            elif mix_implementation == "current":
-                sources = []
-                shared_dataset_cache = {}
-                for source_index, (source_cfg, source_meta, source_delta_timestamp) in enumerate(
-                    zip(mix_cfg.sources, source_metas, source_delta_timestamps, strict=True)
-                ):
-                    sources.append(
-                        LogicalSource(
-                            source_index=source_index,
-                            config=source_cfg,
-                            meta=source_meta,
-                            delta_timestamps=source_delta_timestamp,
-                            image_transforms=image_transforms,
-                            default_tolerance_s=cfg.tolerance_s,
-                            shared_dataset_cache=shared_dataset_cache,
-                            retained_features=mix_cfg.retained_features,
-                            visual_target_size=visual_target_size,
-                        )
-                    )
-
-                dataset = MixedLeRobotDataset(
-                    logical_repo_id=cfg.dataset.repo_id,
-                    mix_path=mix_cfg.path,
-                    sources=sources,
-                    enforce_matching_fps=mix_cfg.enforce_matching_fps,
-                    enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
-                    allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported dataset.mix_implementation={mix_implementation!r}"
-                )
+            raise ValueError(
+                f"Unsupported dataset.mix_implementation={mix_implementation!r}"
+            )
     elif isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
