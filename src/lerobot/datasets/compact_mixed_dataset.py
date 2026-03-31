@@ -502,10 +502,14 @@ class CompactSourceAdapter:
         return int(compiled.valid_anchor_start[episode_pos] + (index - prev_total))
 
     def make_dataset(self) -> LeRobotDataset:
+        # Keep compact sources pinned to absolute anchors over the full physical
+        # dataset. Opening a per-source filtered LeRobotDataset is dramatically
+        # slower on large parquet-backed caches and defeats the compact path's
+        # intent of cheap logical splits over shared storage.
         return LeRobotDataset(
             self.repo_id,
             root=self.meta.root,
-            episodes=list(self.selected_episodes),
+            episodes=None,
             image_transforms=self.image_transforms,
             delta_timestamps=self.raw_delta_timestamps,
             revision=self.revision,

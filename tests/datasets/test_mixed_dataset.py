@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from lerobot.configs.default import DatasetConfig
-from lerobot.datasets.compact_mixed_dataset import CompactMixedDataset
+from lerobot.datasets.compact_mixed_dataset import CompactMixedDataset, CompactSourceAdapter
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mixed_dataset import (
@@ -314,6 +314,35 @@ def test_compact_manifest_default_runtime_cache_scales_with_active_sources(tmp_p
     assert isinstance(dataset, CompactMixedDataset)
     assert len(dataset.sources) == 3
     assert dataset.max_open_datasets_per_worker == 3
+
+
+def test_compact_source_opens_full_physical_dataset_for_logical_splits(tmp_path):
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", [3, 3, 4, 4]
+    )
+    mix_path = _write_mix_config(tmp_path / "mix.yaml", dataset_root)
+    dataset = make_dataset(
+        _make_cfg(
+            mix_path,
+            mix_implementation="compact_manifest",
+        )
+    )
+
+    assert isinstance(dataset, CompactMixedDataset)
+
+    source = dataset.sources[0]
+    assert isinstance(source, CompactSourceAdapter)
+
+    physical_dataset = source.make_dataset()
+
+    assert physical_dataset.episodes is None
+    assert physical_dataset._absolute_to_relative_idx is None
+
+    anchor_abs_index = source.flat_index_to_anchor(0)
+    item = source.fetch_one(physical_dataset, anchor_abs_index=anchor_abs_index)
+
+    assert int(item["index"]) == anchor_abs_index
+    assert item["dataset_source_name"] == source.name
 
 
 def test_mixed_dataset_collates_supervision_and_source_metadata(tmp_path):
