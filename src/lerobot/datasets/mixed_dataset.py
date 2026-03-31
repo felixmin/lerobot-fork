@@ -18,6 +18,7 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import WeightedSourceSampler
 from lerobot.datasets.utils import flatten_dict, unflatten_dict
+from lerobot.utils.constants import ACTION
 
 VALID_SUPERVISION_MODES = {"latent_only", "multitask"}
 logger = logging.getLogger(__name__)
@@ -40,6 +41,10 @@ class DatasetMixSourceConfig:
     supervision: str = "multitask"
     video_backend: str | None = None
     tolerance_s: float | None = None
+    camera_keys: tuple[str, ...] | None = None
+    camera_map: dict[str, str] | None = None
+    action_key: str | None = None
+    filtering: dict[str, Any] | None = None
     feature_key_mapping: dict[str, str] | None = None
 
 
@@ -74,6 +79,8 @@ class MixedSourceMetadata:
     video_backend: str | None
     tolerance_s: float
     num_frames: int
+    filter_cache_path: str | None = None
+    filter_summary: dict[str, Any] | None = None
     feature_key_mapping: dict[str, str]
     retained_features: tuple[str, ...] | None
 
@@ -331,6 +338,40 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
                 "A mix source cannot define both 'episodes' and 'exclude_episodes'."
             )
 
+        raw_camera_keys = raw_source.get("camera_keys")
+        raw_camera_map = raw_source.get("camera_map")
+        if raw_camera_keys is not None and raw_camera_map is not None:
+            raise ValueError(
+                "A mix source cannot define both 'camera_keys' and 'camera_map'."
+            )
+
+        camera_keys: tuple[str, ...] | None = None
+        camera_map: dict[str, str] | None = None
+
+        if raw_camera_keys is not None:
+            if not isinstance(raw_camera_keys, list):
+                raise TypeError("Expected 'camera_keys' to be a list of camera feature keys.")
+            if any(not isinstance(value, str) for value in raw_camera_keys):
+                raise TypeError("Expected 'camera_keys' to contain only strings.")
+            if len(raw_camera_keys) == 0:
+                raise ValueError("Expected 'camera_keys' to contain at least one entry.")
+            camera_keys = tuple(raw_camera_keys)
+
+        if raw_camera_map is not None:
+            if not isinstance(raw_camera_map, dict):
+                raise TypeError("Expected 'camera_map' to be a mapping of role to camera key.")
+            if len(raw_camera_map) == 0:
+                raise ValueError("Expected 'camera_map' to contain at least one mapping.")
+            parsed_map = {
+                str(role): str(camera_key)
+                for role, camera_key in raw_camera_map.items()
+            }
+            camera_map = parsed_map
+
+        raw_filtering = raw_source.get("filtering")
+        if raw_filtering is not None and not isinstance(raw_filtering, dict):
+            raise TypeError("Expected 'filtering' to be a mapping when provided.")
+
         source = DatasetMixSourceConfig(
             name=str(raw_source["name"]),
             repo_id=str(raw_source["repo_id"]),
@@ -362,6 +403,12 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
                 field_name="feature_key_mapping",
                 value=raw_source.get("feature_key_mapping"),
             ),
+            camera_keys=camera_keys,
+            camera_map=camera_map,
+            action_key=(
+                None if raw_source.get("action_key") is None else str(raw_source["action_key"])
+            ),
+            filtering=(None if raw_filtering is None else deepcopy(raw_filtering)),
         )
         if source.name in seen_names:
             raise ValueError(f"Duplicate mix source name '{source.name}'.")
@@ -673,7 +720,9 @@ class LogicalSource:
         image_transforms: Any = None,
         default_tolerance_s: float = 1e-4,
         shared_dataset_cache: dict[tuple[Any, ...], LeRobotDataset] | None = None,
-        retained_features: tuple[str, ...] | None = None,
+        request_image_deltas: tuple[int, ...] | None = None,
+        global_filtering_cfg: dict[str, Any] | None = None,
+	retained_features: tuple[str, ...] | None = None,
         visual_target_size: tuple[int, int] | list[int] | None = None,
     ) -> None:
         self.source_index = int(source_index)
@@ -756,6 +805,117 @@ class LogicalSource:
             {} if shared_dataset_cache is None else shared_dataset_cache
         )
 
+
+        self._request_image_deltas = (
+            None
+            if request_image_deltas is None
+            else tuple(int(delta) for delta in request_image_deltas)
+        )
+        self._global_filtering_cfg = (
+            None if global_filtering_cfg is None else deepcopy(global_filtering_cfg)
+        )
+        self._filter_cache_path: str | None = None
+        self._filter_summary: dict[str, Any] | None = None
+        self._kept_anchor_values: np.ndarray | None = None
+        self._kept_offsets_start: np.ndarray | None = None
+        self._kept_counts: np.ndarray | None = None
+        self._maybe_apply_action_frame_filtering()
+
+    def _selected_filter_camera_keys(self) -> tuple[str, ...]:
+        if self.config.camera_keys is not None:
+            return tuple(str(key) for key in self.config.camera_keys)
+        if self.config.camera_map is not None:
+            return tuple(
+                dict.fromkeys(
+                    str(camera_key) for camera_key in self.config.camera_map.values()
+                )
+            )
+        return tuple(sorted(self.camera_keys))
+
+    def _infer_request_image_deltas(self, camera_key: str) -> tuple[int, ...]:
+        if self._request_image_deltas is not None:
+            return self._request_image_deltas
+        if self.delta_timestamps is None or camera_key not in self.delta_timestamps:
+            raise ValueError(
+                f"Cannot infer request_image_deltas for source={self.name!r}: missing camera {camera_key!r}."
+            )
+        fps = float(self.meta.fps)
+        deltas_seconds = self.delta_timestamps[camera_key]
+        return tuple(int(round(float(delta_s) * fps)) for delta_s in deltas_seconds)
+
+    def _maybe_apply_action_frame_filtering(self) -> None:
+        source_filtering = self.config.filtering
+        global_filtering = self._global_filtering_cfg
+        if source_filtering is None and global_filtering is None:
+            return
+
+        from common.action_frame_filtering import build_action_frame_filter
+        from common.action_frame_filtering import normalize_filtering_config
+
+        filtering_cfg = normalize_filtering_config(
+            global_filtering=global_filtering,
+            source_filtering=source_filtering,
+        )
+        if filtering_cfg is None or not bool(filtering_cfg.get("apply_at_sampling", True)):
+            return
+
+        camera_dataset_keys = self._selected_filter_camera_keys()
+        if len(camera_dataset_keys) == 0:
+            raise ValueError(
+                f"Source {self.name!r} resolved zero camera keys for filtering"
+            )
+        request_image_deltas = self._infer_request_image_deltas(camera_dataset_keys[0])
+        action_key = self.config.action_key
+        if action_key is None and ACTION in self.features:
+            action_key = ACTION
+        motion_cfg = dict(filtering_cfg.get("motion", {}))
+        camera_aggregate_reduce = str(motion_cfg.get("aggregate_reduce", "mean"))
+
+        result = build_action_frame_filter(
+            repo_id=self.repo_id,
+            root=self.root,
+            revision=self.revision,
+            video_backend=self.config.video_backend,
+            tolerance_s=self.tolerance_s,
+            request_image_deltas=request_image_deltas,
+            camera_dataset_keys=camera_dataset_keys,
+            camera_aggregate_reduce=camera_aggregate_reduce,
+            action_key=action_key,
+            episode_ids=self.index.episode_indices.astype(np.int32),
+            candidate_start=self.index.dataset_from_index.astype(np.int64),
+            candidate_end=self.index.dataset_to_index.astype(np.int64),
+            filtering_cfg=filtering_cfg,
+            split="train",
+        )
+
+        self._filter_cache_path = result.cache_path
+        self._filter_summary = dict(result.summary)
+        self._kept_anchor_values = result.kept_anchor_values.astype(np.int64)
+        self._kept_offsets_start = result.kept_offsets_start.astype(np.int64)
+        self._kept_counts = result.kept_counts.astype(np.int64)
+
+        cache_status = str(self._filter_summary.get("cache", "unknown"))
+        before = int(self._filter_summary.get("anchors_before", 0))
+        after = int(self._filter_summary.get("anchors_after", 0))
+        if cache_status == "miss":
+            logger.warning(
+                "[mixed-filter] regenerated cache source=%s repo=%s cache=%s before=%d after=%d",
+                self.name,
+                self.repo_id,
+                self._filter_cache_path,
+                before,
+                after,
+            )
+        else:
+            logger.info(
+                "[mixed-filter] cache_hit source=%s repo=%s cache=%s before=%d after=%d",
+                self.name,
+                self.repo_id,
+                self._filter_cache_path,
+                before,
+                after,
+            )
+
     @property
     def name(self) -> str:
         return self.config.name
@@ -782,6 +942,8 @@ class LogicalSource:
 
     @property
     def num_frames(self) -> int:
+        if self._kept_counts is not None:
+            return int(self._kept_counts.sum())
         return int(self.index.lengths.sum())
 
     @property
@@ -809,7 +971,10 @@ class LogicalSource:
         return (self.repo_id, str(Path(self.meta.root).resolve()), self.revision)
 
     def get_effective_lengths(self, drop_n_last_frames: int = 0) -> np.ndarray:
-        return np.maximum(self.index.lengths - int(drop_n_last_frames), 0)
+        base_lengths = (
+            self._kept_counts if self._kept_counts is not None else self.index.lengths
+        )
+        return np.maximum(base_lengths - int(drop_n_last_frames), 0)
 
     def flat_index_to_anchor(self, index: int, *, drop_n_last_frames: int = 0) -> int:
         effective_lengths = self.get_effective_lengths(drop_n_last_frames)
@@ -820,7 +985,11 @@ class LogicalSource:
         cumulative_lengths = np.cumsum(effective_lengths, dtype=np.int64)
         episode_pos = int(np.searchsorted(cumulative_lengths, index, side="right"))
         prev_total = 0 if episode_pos == 0 else int(cumulative_lengths[episode_pos - 1])
-        return int(self.index.dataset_from_index[episode_pos] + (index - prev_total))
+        local_offset = int(index - prev_total)
+        if self._kept_anchor_values is None or self._kept_offsets_start is None:
+            return int(self.index.dataset_from_index[episode_pos] + local_offset)
+        global_offset = int(self._kept_offsets_start[episode_pos]) + local_offset
+        return int(self._kept_anchor_values[global_offset])
 
     def metadata(self) -> MixedSourceMetadata:
         return MixedSourceMetadata(
@@ -834,6 +1003,10 @@ class LogicalSource:
             video_backend=self.config.video_backend,
             tolerance_s=self.tolerance_s,
             num_frames=self.num_frames,
+            filter_cache_path=self._filter_cache_path,
+            filter_summary=(
+                None if self._filter_summary is None else deepcopy(self._filter_summary)
+            ),
             feature_key_mapping=deepcopy(self.feature_key_mapping),
             retained_features=self.retained_features,
         )
@@ -969,6 +1142,8 @@ def _build_mixed_info(
             "video_backend": metadata.video_backend,
             "tolerance_s": metadata.tolerance_s,
             "num_frames": metadata.num_frames,
+            "filter_cache_path": metadata.filter_cache_path,
+            "filter_summary": metadata.filter_summary,
             "feature_key_mapping": deepcopy(metadata.feature_key_mapping),
             "retained_features": (
                 None

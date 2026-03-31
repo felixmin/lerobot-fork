@@ -46,6 +46,21 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
 
 
+def _normalize_features_for_comparison(features: dict) -> dict:
+    """Normalize feature metadata for compatibility checks.
+
+    Some datasets store per-feature `fps` while others only use top-level fps.
+    These representations are equivalent for aggregation.
+    """
+    normalized = {}
+    for key, feature in features.items():
+        if isinstance(feature, dict):
+            normalized[key] = {k: v for k, v in feature.items() if k != "fps"}
+        else:
+            normalized[key] = feature
+    return normalized
+
+
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     """Validates that all dataset metadata have consistent properties.
 
@@ -66,6 +81,7 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     fps = all_metadata[0].fps
     robot_type = all_metadata[0].robot_type
     features = all_metadata[0].features
+    normalized_features = _normalize_features_for_comparison(features)
 
     for meta in tqdm.tqdm(all_metadata, desc="Validate all meta data"):
         if fps != meta.fps:
@@ -74,7 +90,7 @@ def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
             raise ValueError(
                 f"Same robot_type is expected, but got robot_type={meta.robot_type} instead of {robot_type}."
             )
-        if features != meta.features:
+        if normalized_features != _normalize_features_for_comparison(meta.features):
             raise ValueError(
                 f"Same features is expected, but got features={meta.features} instead of {features}."
             )
@@ -193,7 +209,7 @@ def update_meta_data(
         if src_to_dst:
             # Map each episode to its correct destination file and apply offset
             for idx in df.index:
-                src_key = (df.at[idx, "_orig_chunk"], df.at[idx, "_orig_file"])
+                src_key = (int(df.at[idx, "_orig_chunk"]), int(df.at[idx, "_orig_file"]))
 
                 # Get destination chunk/file for this source file
                 dst_chunk, dst_file = src_to_dst.get(src_key, (video_idx["chunk"], video_idx["file"]))
@@ -209,7 +225,7 @@ def update_meta_data(
             df[orig_chunk_col] = video_idx["chunk"]
             df[orig_file_col] = video_idx["file"]
             for idx in df.index:
-                src_key = (df.at[idx, "_orig_chunk"], df.at[idx, "_orig_file"])
+                src_key = (int(df.at[idx, "_orig_chunk"]), int(df.at[idx, "_orig_file"]))
                 offset = src_to_offset.get(src_key, 0)
                 df.at[idx, f"videos/{key}/from_timestamp"] += offset
                 df.at[idx, f"videos/{key}/to_timestamp"] += offset
@@ -363,6 +379,8 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
         dst_file_durations = video_idx["dst_file_durations"]
 
         for src_chunk_idx, src_file_idx in unique_chunk_file_pairs:
+            src_chunk_idx = int(src_chunk_idx)
+            src_file_idx = int(src_file_idx)
             src_path = src_meta.root / DEFAULT_VIDEO_PATH.format(
                 video_key=key,
                 chunk_index=src_chunk_idx,
@@ -467,6 +485,8 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
     src_to_dst: dict[tuple[int, int], tuple[int, int]] = {}
 
     for src_chunk_idx, src_file_idx in unique_chunk_file_ids:
+        src_chunk_idx = int(src_chunk_idx)
+        src_file_idx = int(src_file_idx)
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )

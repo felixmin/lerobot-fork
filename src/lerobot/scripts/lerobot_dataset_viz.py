@@ -63,6 +63,7 @@ import argparse
 import gc
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -105,11 +106,84 @@ def visualize_dataset(
 
     repo_id = dataset.repo_id
 
+    def _find_none_paths(value, prefix: str = "") -> list[str]:
+        if value is None:
+            return [prefix or "<root>"]
+
+        if isinstance(value, Mapping):
+            paths = []
+            for key, child in value.items():
+                child_prefix = f"{prefix}.{key}" if prefix else str(key)
+                paths.extend(_find_none_paths(child, child_prefix))
+            return paths
+
+        # Strings/bytes are Sequences but should be treated as leaves.
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            paths = []
+            for idx, child in enumerate(value):
+                child_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+                paths.extend(_find_none_paths(child, child_prefix))
+            return paths
+
+        return []
+
     logging.info("Loading dataloader")
+
+    def safe_collate(batch):
+        filtered = []
+        dropped = []
+        stripped = []
+
+        for sample_pos, sample in enumerate(batch):
+            if sample is None:
+                dropped.append((sample_pos, ["<sample>"]))
+                continue
+
+            if isinstance(sample, Mapping):
+                removed_top_level = [key for key, value in sample.items() if value is None]
+                if removed_top_level:
+                    sample = {key: value for key, value in sample.items() if value is not None}
+                    stripped.append((sample_pos, removed_top_level[:3]))
+
+            none_paths = _find_none_paths(sample)
+            if none_paths:
+                dropped.append((sample_pos, none_paths[:3]))
+                continue
+
+            filtered.append(sample)
+
+        if dropped:
+            dropped_preview = ", ".join(
+                f"sample#{sample_pos} none_at={paths}" for sample_pos, paths in dropped[:3]
+            )
+            logging.warning(
+                "Dropped %d/%d invalid samples before collation. Examples: %s",
+                len(dropped),
+                len(batch),
+                dropped_preview,
+            )
+
+        if stripped:
+            stripped_preview = ", ".join(
+                f"sample#{sample_pos} removed_keys={paths}" for sample_pos, paths in stripped[:3]
+            )
+            logging.warning(
+                "Stripped None-valued fields in %d/%d samples before collation. Examples: %s",
+                len(stripped),
+                len(batch),
+                stripped_preview,
+            )
+
+        if not filtered:
+            return None
+
+        return torch.utils.data.default_collate(filtered)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=num_workers,
         batch_size=batch_size,
+        collate_fn=safe_collate,
     )
 
     logging.info("Starting Rerun")
@@ -126,9 +200,7 @@ def visualize_dataset(
     gc.collect()
 
     if mode == "distant":
-        server_uri = rr.serve_grpc(grpc_port=grpc_port)
-        logging.info(f"Connect to a Rerun Server: rerun rerun+http://IP:{grpc_port}/proxy")
-        rr.serve_web_viewer(open_browser=False, web_port=web_port, connect_to=server_uri)
+        rr.serve_web_viewer(open_browser=False, web_port=web_port)
 
     logging.info("Logging to Rerun")
 
@@ -276,6 +348,9 @@ def main():
     parser.add_argument(
         "--display-compressed-images",
         action="store_true",
+        type=bool,
+        required=True,
+        default=False,
         help="If set, display compressed images in Rerun instead of uncompressed ones.",
     )
 

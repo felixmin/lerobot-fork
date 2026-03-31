@@ -487,10 +487,13 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
         output_dir = HF_LEROBOT_HOME / cfg.new_repo_id
         logging.info(f"Saving to new dataset: {cfg.new_repo_id} at {output_dir}")
     elif output_dir_config:
+        # Use custom output directory for local-only storage
         output_dir = Path(output_dir_config)
+        # Extract repo name from output_dir for the dataset
         output_repo_id = output_dir.name
         logging.info(f"Saving to local directory: {output_dir} as {output_repo_id}")
     else:
+        # Auto-generate name: append "_video" to original repo_id
         output_repo_id = f"{cfg.repo_id}_video"
         output_dir = HF_LEROBOT_HOME / output_repo_id
         logging.info(f"Saving to auto-generated location: {output_dir} as {output_repo_id}")

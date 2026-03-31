@@ -20,14 +20,16 @@ import torch
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import (
+    LeRobotDataset,
+    LeRobotDatasetMetadata,
+    MultiLeRobotDataset,
+)
 from lerobot.datasets.mixed_dataset import (
     LogicalSource,
     MixedLeRobotDataset,
     load_dataset_mix_config,
 )
-from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
@@ -39,7 +41,10 @@ IMAGENET_STATS = {
 
 
 def resolve_delta_timestamps(
-    cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
+    cfg: PreTrainedConfig,
+    ds_meta: LeRobotDatasetMetadata,
+    *,
+    source_camera_keys: set[str] | None = None,
 ) -> dict[str, list] | None:
     """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
 
@@ -63,20 +68,92 @@ def resolve_delta_timestamps(
         )
 
     delta_timestamps = {}
+    configured_camera_keys = getattr(cfg, "camera_keys", None)
+    allowed_camera_keys = (
+        None
+        if configured_camera_keys is None
+        else {str(k) for k in configured_camera_keys}
+    )
+    if source_camera_keys is not None:
+        if allowed_camera_keys is None:
+            allowed_camera_keys = set(source_camera_keys)
+        else:
+            allowed_camera_keys = allowed_camera_keys.intersection(source_camera_keys)
+    configured_input_features = getattr(cfg, "input_features", None)
+    visual_input_keys = None
+    if isinstance(configured_input_features, dict) and len(configured_input_features) > 0:
+        visual_input_keys = set()
+        for key, feature in configured_input_features.items():
+            feature_type = str(getattr(feature, "type", "")).upper()
+            if feature_type == "VISUAL":
+                visual_input_keys.add(str(key))
+    selected_observation_image_keys = 0
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and observation_delta_indices is not None:
+        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+            if (
+                allowed_camera_keys is not None
+                and key.startswith(f"{OBS_PREFIX}images.")
+                and key not in allowed_camera_keys
+            ):
+                continue
+            if (
+                visual_input_keys is not None
+                and key.startswith(f"{OBS_PREFIX}images.")
+                and key not in visual_input_keys
+            ):
+                continue
             delta_timestamps[key] = [
-                i / ds_meta.fps for i in observation_delta_indices
+                i / ds_meta.fps for i in cfg.observation_delta_indices
             ]
+            if key.startswith(f"{OBS_PREFIX}images."):
+                selected_observation_image_keys += 1
+
+    if (
+        source_camera_keys is not None
+        and cfg.observation_delta_indices is not None
+        and selected_observation_image_keys == 0
+    ):
+        raise ValueError(
+            "Source camera selection resolved to zero observation image keys after policy filtering. "
+            f"Requested source cameras={sorted(source_camera_keys)} "
+            f"policy.camera_keys={getattr(cfg, 'camera_keys', None)}"
+        )
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
     return delta_timestamps
+
+
+def _resolve_source_camera_keys(
+    source_cfg,
+    source_meta: LeRobotDatasetMetadata,
+) -> set[str] | None:
+    source_camera_keys = source_cfg.camera_keys
+    source_camera_map = source_cfg.camera_map
+    if source_camera_keys is None and source_camera_map is None:
+        return None
+
+    if source_camera_keys is not None:
+        selected = {str(key) for key in source_camera_keys}
+    else:
+        selected = {str(camera_key) for camera_key in source_camera_map.values()}
+
+    available_cameras = {
+        key
+        for key, feature in source_meta.features.items()
+        if feature.get("dtype") in {"image", "video"}
+    }
+    missing = sorted(key for key in selected if key not in available_cameras)
+    if missing:
+        raise ValueError(
+            f"Mix source {source_cfg.name!r} requested unknown camera keys: {missing}"
+        )
+    return selected
 
 
 def make_dataset(
@@ -107,6 +184,10 @@ def make_dataset(
         visual_target_size = getattr(cfg.policy, "image_size", None)
         sources = []
         shared_dataset_cache = {}
+        request_image_deltas = None
+        if cfg.policy.observation_delta_indices is not None:
+            request_image_deltas = tuple(int(x) for x in cfg.policy.observation_delta_indices)
+        global_filtering_cfg = getattr(cfg.dataset, "filtering", None)
         for source_index, source_cfg in enumerate(mix_cfg.sources):
             source_meta = LeRobotDatasetMetadata(
                 source_cfg.repo_id,
@@ -114,7 +195,24 @@ def make_dataset(
                 revision=source_cfg.revision,
             )
 
-            source_delta_timestamps = resolve_delta_timestamps(cfg.policy, source_meta)
+            if (
+                getattr(cfg.policy, "type", None) == "latent_smol"
+                and getattr(cfg.policy, "head_mode", None) == "latent"
+                and getattr(cfg.policy, "lam_future_frames", 0) <= 0
+            ):
+                cfg.policy.lam_future_frames = max(
+                    1, round(source_meta.fps * cfg.policy.lam_future_seconds)
+                )
+                logging.info(
+                    f"Computed lam_future_frames={cfg.policy.lam_future_frames} (fps={source_meta.fps})"
+                )
+
+            source_selected_camera_keys = _resolve_source_camera_keys(source_cfg, source_meta)
+            source_delta_timestamps = resolve_delta_timestamps(
+                cfg.policy,
+                source_meta,
+                source_camera_keys=source_selected_camera_keys,
+            )
             sources.append(
                 LogicalSource(
                     source_index=source_index,
@@ -126,6 +224,8 @@ def make_dataset(
                     shared_dataset_cache=shared_dataset_cache,
                     retained_features=mix_cfg.retained_features,
                     visual_target_size=visual_target_size,
+                    request_image_deltas=request_image_deltas,
+                    global_filtering_cfg=global_filtering_cfg,
                 )
             )
 
@@ -141,6 +241,19 @@ def make_dataset(
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+
+        # Compute lam_future_frames for latent_smol in latent mode before resolving delta timestamps
+        if (
+            getattr(cfg.policy, "type", None) == "latent_smol"
+            and getattr(cfg.policy, "head_mode", None) == "latent"
+            and getattr(cfg.policy, "lam_future_frames", 0) <= 0
+        ):
+            cfg.policy.lam_future_frames = max(
+                1, round(ds_meta.fps * cfg.policy.lam_future_seconds)
+            )
+            logging.info(
+                f"Computed lam_future_frames={cfg.policy.lam_future_frames} (fps={ds_meta.fps})"
+            )
 
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         if not cfg.dataset.streaming:
