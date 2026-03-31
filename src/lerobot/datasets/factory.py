@@ -23,7 +23,6 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
-    MultiLeRobotDataset,
 )
 from lerobot.datasets.mixed_dataset import (
     LogicalSource,
@@ -158,7 +157,7 @@ def _resolve_source_camera_keys(
 
 def make_dataset(
     cfg: TrainPipelineConfig,
-) -> LeRobotDataset | MixedLeRobotDataset | MultiLeRobotDataset:
+) -> LeRobotDataset | MixedLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -168,7 +167,7 @@ def make_dataset(
         NotImplementedError: The MultiLeRobotDataset is currently deactivated.
 
     Returns:
-        LeRobotDataset | MultiLeRobotDataset
+        LeRobotDataset | MixedLeRobotDataset
     """
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms)
@@ -280,17 +279,6 @@ def make_dataset(
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
-        dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            video_backend=cfg.dataset.video_backend,
-        )
-        logging.info(
-            "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
-            f"{pformat(dataset.repo_id_to_index, indent=2)}"
-        )
 
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:

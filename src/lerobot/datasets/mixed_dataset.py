@@ -79,10 +79,10 @@ class MixedSourceMetadata:
     video_backend: str | None
     tolerance_s: float
     num_frames: int
-    filter_cache_path: str | None = None
-    filter_summary: dict[str, Any] | None = None
     feature_key_mapping: dict[str, str]
     retained_features: tuple[str, ...] | None
+    filter_cache_path: str | None = None
+    filter_summary: dict[str, Any] | None = None
 
 
 @dataclass
