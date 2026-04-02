@@ -1084,7 +1084,9 @@ def build_action_frame_filter(
         tolerance_s=(1.0e-4 if tolerance_s is None else float(tolerance_s)),
     )
 
-    max_anchor_end_exclusive = max(0, int(len(ds.hf_dataset)) - int(frame_gap))
+    action_lookahead = max(0, int(action_chunk_size) - 1) if action_enabled else 0
+    temporal_lookahead = max(int(frame_gap), action_lookahead)
+    max_anchor_end_exclusive = max(0, int(len(ds.hf_dataset)) - int(temporal_lookahead))
     raw_candidate_start = candidate_start.astype(np.int64, copy=False)
     raw_candidate_end = candidate_end.astype(np.int64, copy=False)
     candidate_start = np.clip(raw_candidate_start, 0, max_anchor_end_exclusive).astype(
