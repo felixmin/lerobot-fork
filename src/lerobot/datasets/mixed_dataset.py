@@ -849,8 +849,9 @@ class LogicalSource:
         if source_filtering is None and global_filtering is None:
             return
 
-        from common.action_frame_filtering import build_action_frame_filter
-        from common.action_frame_filtering import normalize_filtering_config
+        from lerobot.datasets.action_frame_filtering import build_action_frame_filter
+        from lerobot.datasets.action_frame_filtering import infer_motion_frame_gap
+        from lerobot.datasets.action_frame_filtering import normalize_filtering_config
 
         filtering_cfg = normalize_filtering_config(
             global_filtering=global_filtering,
@@ -870,6 +871,15 @@ class LogicalSource:
             action_key = ACTION
         motion_cfg = dict(filtering_cfg.get("motion", {}))
         camera_aggregate_reduce = str(motion_cfg.get("aggregate_reduce", "mean"))
+        frame_gap = infer_motion_frame_gap(
+            request_image_deltas=request_image_deltas,
+            configured_frame_gap=motion_cfg.get("frame_gap"),
+        )
+        candidate_start = self.index.dataset_from_index.astype(np.int64)
+        candidate_end = np.maximum(
+            candidate_start,
+            self.index.dataset_to_index.astype(np.int64) - int(max(1, frame_gap)),
+        )
 
         result = build_action_frame_filter(
             repo_id=self.repo_id,
@@ -882,8 +892,8 @@ class LogicalSource:
             camera_aggregate_reduce=camera_aggregate_reduce,
             action_key=action_key,
             episode_ids=self.index.episode_indices.astype(np.int32),
-            candidate_start=self.index.dataset_from_index.astype(np.int64),
-            candidate_end=self.index.dataset_to_index.astype(np.int64),
+            candidate_start=candidate_start,
+            candidate_end=candidate_end,
             filtering_cfg=filtering_cfg,
             split="train",
         )

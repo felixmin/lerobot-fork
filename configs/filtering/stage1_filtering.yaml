@@ -1,0 +1,41 @@
+dataset:
+  filtering:
+    enabled: true
+    mode: both
+    apply_at_sampling: true
+    trim_episode_ends: true
+    motion:
+      enabled: true
+      method: frame_diff
+      frame_gap: null
+      decode_backend: null
+      decode_chunk_size: 64
+      prefetch_next_episode: true
+      prefetch_chunk_size: 64
+      device: cuda
+      aggregate_all_cameras: true
+      aggregate_reduce: mean
+      resize_short_side: 224
+      grayscale: true
+      blur_kernel: 5
+      diff_pixel_threshold: 0.03
+      smoothing_window: 5
+      consecutive_active_k: 3
+      low_threshold: 0.012
+      high_threshold: 0.02
+      use_hysteresis: true
+      sparse_flow:
+        enabled: false
+    action:
+      enabled: true
+      method: norm
+      threshold: 0.0015
+      exclude_dims: []
+      delta_dims: [6]
+      chunk_size: 3
+      chunk_reduce: max
+      min_nonzero_ratio: 0.2
+    cache:
+      enabled: true
+      reuse_if_config_unchanged: true
+      force_recompute: false

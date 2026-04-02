@@ -1,0 +1,55 @@
+sources:
+  - name: teleop_v1_stage3_smoke
+    repo_id: LSY-lab/simple_tasks_teleop_v1
+    revision: main
+    weight: 100.0
+    supervision: multitask
+    video_backend: pyav
+    tolerance_s: 0.0001
+    camera_map:
+      primary: observation.images.fpv
+      eagles_view: observation.images.eagles_view
+      orth: observation.images.orth
+      person_view_3rd_1st: observation.images.person_view_3rd_1st
+    action_key: action
+    episodes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    filtering:
+      enabled: true
+      mode: both
+      apply_at_sampling: true
+      trim_episode_ends: true
+      motion:
+        enabled: true
+        method: frame_diff
+        frame_gap: null
+        decode_backend: null
+        decode_chunk_size: 64
+        prefetch_next_episode: true
+        prefetch_chunk_size: 64
+        device: cuda
+        aggregate_all_cameras: true
+        aggregate_reduce: mean
+        resize_short_side: 224
+        grayscale: true
+        blur_kernel: 5
+        diff_pixel_threshold: 0.03
+        smoothing_window: 5
+        consecutive_active_k: 3
+        low_threshold: 0.012
+        high_threshold: 0.02
+        use_hysteresis: true
+        sparse_flow:
+          enabled: false
+      action:
+        enabled: true
+        method: norm
+        threshold: 0.0025
+        exclude_dims: []
+        delta_dims: [6]
+        chunk_size: 3
+        chunk_reduce: max
+        min_nonzero_ratio: 0.2
+      cache:
+        enabled: true
+        reuse_if_config_unchanged: true
+        force_recompute: true

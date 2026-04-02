@@ -1,0 +1,66 @@
+sources:
+  - name: teleop_v1
+    repo_id: LSY-lab/simple_tasks_teleop_v1
+    # root: null  # Omit to auto-use local HF cache / download if missing.
+    revision: main
+    weight: 70.0
+    supervision: multitask
+    video_backend: pyav
+    tolerance_s: 0.0001
+    camera_map:
+      primary: observation.images.fpv
+      eagles_view: observation.images.eagles_view
+      orth: observation.images.orth
+      person_view_3rd_1st: observation.images.person_view_3rd_1st
+    action_key: action
+    filtering:
+      enabled: true
+      mode: both
+      apply_at_sampling: true
+      trim_episode_ends: true
+      motion:
+        enabled: true
+        method: frame_diff
+        frame_gap: null
+        decode_backend: null
+        decode_chunk_size: 64
+        prefetch_next_episode: true
+        prefetch_chunk_size: 64
+        device: cuda
+        aggregate_all_cameras: true
+        aggregate_reduce: mean
+        low_threshold: 0.012
+        high_threshold: 0.02
+        use_hysteresis: true
+      action:
+        enabled: true
+        method: norm
+        threshold: 0.0015
+        exclude_dims: []
+        delta_dims: [6]
+        chunk_size: 3
+        chunk_reduce: max
+        min_nonzero_ratio: 0.2
+      cache:
+        enabled: true
+        reuse_if_config_unchanged: true
+        force_recompute: false
+
+  - name: human_dataset
+    repo_id: LSY-lab/simple_tasks_human_rec_v0
+    # root: null
+    revision: main
+    weight: 30.0
+    supervision: multitask
+    video_backend: pyav
+    tolerance_s: 0.0001
+    camera_map:
+      primary: observation.images.fpv
+      eagles_view: observation.images.eagles_view
+      orth: observation.images.orth
+      person_view_3rd_1st: observation.images.person_view_3rd_1st
+    action_key: action
+    # Optionally override filtering for this source only:
+    filtering:
+      motion:
+        low_threshold: 0.015
