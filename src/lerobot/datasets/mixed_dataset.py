@@ -870,15 +870,25 @@ class LogicalSource:
         if action_key is None and ACTION in self.features:
             action_key = ACTION
         motion_cfg = dict(filtering_cfg.get("motion", {}))
+        action_cfg = dict(filtering_cfg.get("action", {}))
         camera_aggregate_reduce = str(motion_cfg.get("aggregate_reduce", "mean"))
         frame_gap = infer_motion_frame_gap(
             request_image_deltas=request_image_deltas,
             configured_frame_gap=motion_cfg.get("frame_gap"),
         )
+        mode = str(filtering_cfg.get("mode", "none"))
+        action_enabled = (
+            bool(action_cfg.get("enabled", False))
+            and mode in {"action", "both"}
+            and action_key is not None
+        )
+        action_chunk_size = int(action_cfg.get("chunk_size", 1))
+        action_lookahead = max(0, action_chunk_size - 1) if action_enabled else 0
+        temporal_lookahead = max(int(frame_gap), int(action_lookahead))
         candidate_start = self.index.dataset_from_index.astype(np.int64)
         candidate_end = np.maximum(
             candidate_start,
-            self.index.dataset_to_index.astype(np.int64) - int(max(1, frame_gap)),
+            self.index.dataset_to_index.astype(np.int64) - int(max(1, temporal_lookahead)),
         )
 
         result = build_action_frame_filter(
