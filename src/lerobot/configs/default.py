@@ -71,6 +71,9 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Multiprocessing context for async vector environments. When left as None, LeRobot may pick
+    # an environment-specific default. For LIBERO, `spawn` is safer than `fork` with MuJoCo/OSMesa.
+    async_env_context: str | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:

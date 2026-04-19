@@ -317,6 +317,10 @@ def update_policy(
                     accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
+                    if has_method(unwrapped_policy, "get_gradient_metrics"):
+                        if output_dict_local is None:
+                            output_dict_local = {}
+                        output_dict_local.update(unwrapped_policy.get_gradient_metrics())
                     if grad_clip_norm > 0:
                         grad_norm = accelerator.clip_grad_norm_(
                             policy.parameters(), grad_clip_norm
@@ -578,7 +582,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
         eval_env = make_env(
-            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+            cfg.env,
+            n_envs=cfg.eval.batch_size,
+            use_async_envs=cfg.eval.use_async_envs,
+            async_env_context=cfg.eval.async_env_context,
         )
 
     if is_main_process:

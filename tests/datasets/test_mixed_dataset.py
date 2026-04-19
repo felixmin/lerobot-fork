@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -155,6 +156,40 @@ def _write_three_source_mix_config(path: Path, dataset_root: Path) -> Path:
     return path
 
 
+def _write_labeled_disjoint_mix_config(path: Path, dataset_root: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [
+                    {
+                        "name": "latent_only",
+                        "repo_id": "local/stage3",
+                        "root": str(dataset_root),
+                        "weight": 4.0,
+                        "episodes": [0, 2],
+                        "action_supervision": False,
+                        "latent_supervision": True,
+                        "video_backend": "pyav",
+                        "tolerance_s": 0.0001,
+                    },
+                    {
+                        "name": "action_only",
+                        "repo_id": "local/stage3",
+                        "root": str(dataset_root),
+                        "weight": 1.0,
+                        "exclude_episodes": [0, 2],
+                        "action_supervision": True,
+                        "latent_supervision": False,
+                        "video_backend": "pyav",
+                        "tolerance_s": 0.0001,
+                    },
+                ]
+            }
+        )
+    )
+    return path
+
+
 def _make_cfg(
     mix_path: Path,
     *,
@@ -189,6 +224,10 @@ def _make_cfg_with_observation_delta(mix_path: Path, observation_delta_indices: 
         ),
         tolerance_s=1e-4,
     )
+
+
+def _item_episode_index(item: dict[str, torch.Tensor | str]) -> int:
+    return int(torch.as_tensor(item["action"])[0].item())
 
 
 def test_load_dataset_mix_config_supports_mix_path(tmp_path):
@@ -419,6 +458,81 @@ def test_mixed_dataset_shares_physical_dataset_instance_across_sources(tmp_path)
     assert shared_a.episodes is None
     assert int(dataset.sources[0].get_item(0)["index"]) == 0
     assert int(dataset.sources[1].get_item(6)["index"]) == 6
+
+
+def test_legacy_mixed_dataset_only_returns_selected_episodes_and_source_labels(tmp_path):
+    episode_lengths = [2, 3, 4, 5]
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", episode_lengths
+    )
+    mix_path = _write_labeled_disjoint_mix_config(
+        tmp_path / "legacy_mix.yaml", dataset_root
+    )
+    dataset = make_dataset(_make_cfg(mix_path, mix_implementation="legacy"))
+
+    assert len(dataset) == sum(episode_lengths)
+
+    episodes_by_source: dict[str, list[int]] = {"latent_only": [], "action_only": []}
+    for item_index in range(len(dataset)):
+        item = dataset[item_index]
+        source_name = item["dataset_source_name"]
+        episodes_by_source[source_name].append(_item_episode_index(item))
+
+        if source_name == "latent_only":
+            assert bool(item["action_supervision"]) is False
+            assert bool(item["latent_supervision"]) is True
+        elif source_name == "action_only":
+            assert bool(item["action_supervision"]) is True
+            assert bool(item["latent_supervision"]) is False
+        else:
+            raise AssertionError(f"Unexpected source name {source_name!r}")
+
+    assert Counter(episodes_by_source["latent_only"]) == Counter({0: 2, 2: 4})
+    assert Counter(episodes_by_source["action_only"]) == Counter({1: 3, 3: 5})
+
+
+def test_legacy_weighted_sampler_respects_source_weights_and_sample_labels(tmp_path):
+    dataset_root = _make_local_dataset(
+        tmp_path / "dataset", "local/stage3", [3, 3, 4, 4]
+    )
+    mix_path = _write_labeled_disjoint_mix_config(
+        tmp_path / "legacy_mix.yaml", dataset_root
+    )
+    dataset = make_dataset(_make_cfg(mix_path, mix_implementation="legacy"))
+
+    sampler = WeightedSourceSampler(
+        sources=dataset.sources,
+        source_weights=dataset.source_weights,
+        num_samples=3000,
+        seed=17,
+        drop_n_last_frames=1,
+    )
+    sampled_indices = list(sampler)
+    source_counts = Counter(source_id for source_id, _ in sampled_indices)
+    latent_fraction = source_counts[0] / len(sampled_indices)
+
+    assert len(dataset.build_sampler(seed=17, drop_n_last_frames=1)) == 10
+    assert latent_fraction > 0.72
+    assert source_counts[1] > 0
+
+    checked_by_source = Counter()
+    for source_id, anchor_abs_index in sampled_indices:
+        if checked_by_source[source_id] >= 20:
+            continue
+
+        item = dataset[(source_id, anchor_abs_index)]
+        source = dataset.sources[source_id]
+        checked_by_source[source_id] += 1
+
+        assert item["dataset_source_name"] == source.name
+        assert bool(item["action_supervision"]) is source.action_supervision
+        assert bool(item["latent_supervision"]) is source.latent_supervision
+        assert _item_episode_index(item) in source.selected_episodes
+
+        if all(checked_by_source[idx] >= 20 for idx in range(len(dataset.sources))):
+            break
+
+    assert checked_by_source == Counter({0: 20, 1: 20})
 
 
 def test_mixed_dataset_meta_stats_follow_explicit_source_weights(tmp_path):

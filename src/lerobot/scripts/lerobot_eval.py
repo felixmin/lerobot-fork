@@ -507,9 +507,6 @@ def _compile_episode_data(
 def eval_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
 
-    # Check device is available
-    device = get_safe_torch_device(cfg.policy.device, log=True)
-
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     set_seed(cfg.seed)
@@ -521,8 +518,13 @@ def eval_main(cfg: EvalPipelineConfig):
         cfg.env,
         n_envs=cfg.eval.batch_size,
         use_async_envs=cfg.eval.use_async_envs,
+        async_env_context=cfg.eval.async_env_context,
         trust_remote_code=cfg.trust_remote_code,
     )
+
+    # Check device after environment startup to avoid touching accelerator runtime before async env workers
+    # are created.
+    get_safe_torch_device(cfg.policy.device, log=True)
 
     logging.info("Making policy.")
 
