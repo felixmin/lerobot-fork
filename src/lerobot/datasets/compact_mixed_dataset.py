@@ -405,8 +405,12 @@ class CompactSourceAdapter:
         return self.config.weight
 
     @property
-    def supervision(self) -> str:
-        return self.config.supervision
+    def action_supervision(self) -> bool:
+        return bool(self.config.action_supervision)
+
+    @property
+    def latent_supervision(self) -> bool:
+        return bool(self.config.latent_supervision)
 
     @property
     def num_frames(self) -> int:
@@ -425,14 +429,6 @@ class CompactSourceAdapter:
         ]
 
     @property
-    def action_supervised(self) -> bool:
-        return self.supervision == "multitask"
-
-    @property
-    def latent_supervised(self) -> bool:
-        return True
-
-    @property
     def dataset_identity(self) -> tuple[str, str | None, str | None]:
         return (self.repo_id, str(Path(self.meta.root).resolve()), self.revision)
 
@@ -443,7 +439,8 @@ class CompactSourceAdapter:
             root=self.root,
             revision=self.revision,
             weight=self.weight,
-            supervision=self.supervision,
+            action_supervision=self.action_supervision,
+            latent_supervision=self.latent_supervision,
             episodes=self.selected_episodes,
             video_backend=self.config.video_backend,
             tolerance_s=self.tolerance_s,
@@ -564,13 +561,12 @@ class CompactSourceAdapter:
                 time_steps = 1 if value.ndim <= 1 else int(value.shape[0])
             item[pad_key] = torch.zeros((time_steps,), dtype=torch.bool)
 
-        item["hlrp_action_supervised"] = torch.tensor(
-            self.action_supervised, dtype=torch.bool
+        item["action_supervision"] = torch.tensor(
+            self.action_supervision, dtype=torch.bool
         )
-        item["hlrp_latent_supervised"] = torch.tensor(
-            self.latent_supervised, dtype=torch.bool
+        item["latent_supervision"] = torch.tensor(
+            self.latent_supervision, dtype=torch.bool
         )
-        item["hlrp_source_name"] = self.name
         item["dataset_source_index"] = torch.tensor(
             self.source_index, dtype=torch.int64
         )
@@ -863,7 +859,8 @@ def _build_compact_mixed_info(
                 "root": source.root,
                 "revision": source.revision,
                 "weight": source.weight,
-                "supervision": source.supervision,
+                "action_supervision": source.action_supervision,
+                "latent_supervision": source.latent_supervision,
                 "episodes": list(source.selected_episodes),
                 "video_backend": source.config.video_backend,
                 "tolerance_s": source.tolerance_s,

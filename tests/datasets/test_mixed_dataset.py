@@ -13,11 +13,20 @@ from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mixed_dataset import (
     MixedLeRobotDataset,
+    _aggregate_selected_stats,
     build_explicit_mixed_stats,
     load_dataset_mix_config,
 )
 from lerobot.datasets.sampler import WeightedSourceSampler
 from lerobot.datasets.utils import flatten_dict
+
+
+def _assert_flat_stats_equal(
+    left: dict[str, np.ndarray], right: dict[str, np.ndarray]
+) -> None:
+    assert set(left) == set(right)
+    for key in left:
+        np.testing.assert_allclose(np.asarray(left[key]), np.asarray(right[key]))
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +77,8 @@ def _write_mix_config(path: Path, dataset_root: Path, *, overlap: bool = False) 
         "repo_id": "local/stage3",
         "root": str(dataset_root),
         "weight": 1.0,
-        "supervision": "multitask",
+        "action_supervision": True,
+        "latent_supervision": True,
         "tolerance_s": 0.0001,
         "video_backend": "pyav",
     }
@@ -87,7 +97,8 @@ def _write_mix_config(path: Path, dataset_root: Path, *, overlap: bool = False) 
                         "root": str(dataset_root),
                         "weight": 3.0,
                         "episodes": [0, 1],
-                        "supervision": "latent_only",
+                        "action_supervision": False,
+                        "latent_supervision": True,
                         "video_backend": "pyav",
                         "tolerance_s": 0.0001,
                     },
@@ -110,7 +121,8 @@ def _write_three_source_mix_config(path: Path, dataset_root: Path) -> Path:
                         "root": str(dataset_root),
                         "weight": 1.0,
                         "episodes": [0],
-                        "supervision": "multitask",
+                        "action_supervision": True,
+                        "latent_supervision": True,
                         "video_backend": "pyav",
                         "tolerance_s": 0.0001,
                     },
@@ -120,7 +132,8 @@ def _write_three_source_mix_config(path: Path, dataset_root: Path) -> Path:
                         "root": str(dataset_root),
                         "weight": 1.0,
                         "episodes": [1],
-                        "supervision": "multitask",
+                        "action_supervision": True,
+                        "latent_supervision": True,
                         "video_backend": "pyav",
                         "tolerance_s": 0.0001,
                     },
@@ -130,7 +143,8 @@ def _write_three_source_mix_config(path: Path, dataset_root: Path) -> Path:
                         "root": str(dataset_root),
                         "weight": 1.0,
                         "exclude_episodes": [0, 1],
-                        "supervision": "multitask",
+                        "action_supervision": True,
+                        "latent_supervision": True,
                         "video_backend": "pyav",
                         "tolerance_s": 0.0001,
                     },
@@ -195,7 +209,8 @@ def test_load_dataset_mix_config_supports_mix_path(tmp_path):
     assert mix_cfg.sources[0].name == "latent_source"
     assert mix_cfg.sources[0].episodes == (0, 1)
     assert mix_cfg.sources[1].exclude_episodes == (0, 1)
-    assert mix_cfg.sources[1].supervision == "multitask"
+    assert mix_cfg.sources[1].action_supervision is True
+    assert mix_cfg.sources[1].latent_supervision is True
 
 
 def test_load_dataset_mix_config_treats_null_episode_fields_as_absent(tmp_path):
@@ -210,7 +225,8 @@ def test_load_dataset_mix_config_treats_null_episode_fields_as_absent(tmp_path):
                         "weight": 1.0,
                         "episodes": [0],
                         "exclude_episodes": None,
-                        "supervision": "latent_only",
+                        "action_supervision": False,
+                        "latent_supervision": True,
                     }
                 ]
             }
@@ -221,6 +237,27 @@ def test_load_dataset_mix_config_treats_null_episode_fields_as_absent(tmp_path):
 
     assert mix_cfg.sources[0].episodes == (0,)
     assert mix_cfg.sources[0].exclude_episodes is None
+
+
+def test_load_dataset_mix_config_rejects_removed_supervision_field(tmp_path):
+    mix_path = tmp_path / "mix_removed_supervision.yaml"
+    mix_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [
+                    {
+                        "name": "latent_source",
+                        "repo_id": "local/stage3",
+                        "weight": 1.0,
+                        "supervision": "latent_only",
+                    }
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="removed field 'supervision'"):
+        load_dataset_mix_config(mix_path)
 
 
 def test_make_dataset_routes_mix_path_and_stamps_supervision(tmp_path):
@@ -238,15 +275,13 @@ def test_make_dataset_routes_mix_path_and_stamps_supervision(tmp_path):
     latent_item = dataset[0]
     multitask_item = dataset[6]
 
-    assert bool(latent_item["hlrp_action_supervised"]) is False
-    assert bool(latent_item["hlrp_latent_supervised"]) is True
-    assert latent_item["hlrp_source_name"] == "latent_source"
+    assert bool(latent_item["action_supervision"]) is False
+    assert bool(latent_item["latent_supervision"]) is True
     assert latent_item["dataset_source_name"] == "latent_source"
     assert latent_item["dataset_source_repo_id"] == "local/stage3"
 
-    assert bool(multitask_item["hlrp_action_supervised"]) is True
-    assert bool(multitask_item["hlrp_latent_supervised"]) is True
-    assert multitask_item["hlrp_source_name"] == "multitask_source"
+    assert bool(multitask_item["action_supervision"]) is True
+    assert bool(multitask_item["latent_supervision"]) is True
     assert multitask_item["dataset_source_name"] == "multitask_source"
     assert multitask_item["dataset_source_root"] == str(dataset_root)
 
@@ -269,7 +304,9 @@ def test_make_dataset_routes_compact_manifest_as_selectable_alternate(tmp_path):
     batch_items = dataset.__getitems__([0, 1, 2])
     assert len(batch_items) == 3
     assert [item["dataset_source_name"] for item in batch_items] == [
-        item["hlrp_source_name"] for item in batch_items
+        "latent_source",
+        "latent_source",
+        "latent_source",
     ]
 
 
@@ -293,7 +330,8 @@ def test_compact_manifest_dataset_collates_mixed_batches(tmp_path):
     )
     batch = next(iter(dataloader))
 
-    assert batch["hlrp_action_supervised"].dtype == torch.bool
+    assert batch["action_supervision"].dtype == torch.bool
+    assert batch["latent_supervision"].dtype == torch.bool
     assert batch["observation.state_is_pad"].dtype == torch.bool
     assert batch["action_is_pad"].dtype == torch.bool
     assert isinstance(batch["dataset_source_name"], list)
@@ -360,9 +398,8 @@ def test_mixed_dataset_collates_supervision_and_source_metadata(tmp_path):
     )
     batch = next(iter(dataloader))
 
-    assert batch["hlrp_action_supervised"].dtype == torch.bool
-    assert batch["hlrp_latent_supervised"].dtype == torch.bool
-    assert isinstance(batch["hlrp_source_name"], list)
+    assert batch["action_supervision"].dtype == torch.bool
+    assert batch["latent_supervision"].dtype == torch.bool
     assert batch["dataset_source_index"].dtype == torch.int64
     assert isinstance(batch["dataset_source_name"], list)
     assert len(batch["dataset_source_name"]) == 3
@@ -407,8 +444,68 @@ def test_mixed_dataset_meta_stats_follow_explicit_source_weights(tmp_path):
 
     assert action_mean.shape == (2,)
     assert action_mean[0] == pytest.approx(1.0, abs=1e-6)
-    assert flatten_dict(dataset.meta.stats) == flatten_dict(
-        build_explicit_mixed_stats(dataset.sources)
+    _assert_flat_stats_equal(
+        flatten_dict(dataset.meta.stats),
+        flatten_dict(build_explicit_mixed_stats(dataset.sources)),
+    )
+
+
+def test_aggregate_selected_stats_falls_back_to_dataset_level_stats_for_missing_keys():
+    meta = SimpleNamespace(
+        episodes=datasets.Dataset.from_dict(
+            {
+                "episode_index": [0, 1],
+                "stats/action/mean": [
+                    np.asarray([1.0, 2.0], dtype=np.float32),
+                    np.asarray([3.0, 4.0], dtype=np.float32),
+                ],
+                "stats/action/std": [
+                    np.asarray([0.5, 0.25], dtype=np.float32),
+                    np.asarray([0.25, 0.5], dtype=np.float32),
+                ],
+                "stats/action/min": [
+                    np.asarray([0.0, 1.0], dtype=np.float32),
+                    np.asarray([2.0, 3.0], dtype=np.float32),
+                ],
+                "stats/action/max": [
+                    np.asarray([2.0, 3.0], dtype=np.float32),
+                    np.asarray([4.0, 5.0], dtype=np.float32),
+                ],
+                "stats/action/count": [
+                    np.asarray([10], dtype=np.int64),
+                    np.asarray([20], dtype=np.int64),
+                ],
+            }
+        ),
+        stats={
+            "action": {
+                "mean": np.asarray([99.0, 99.0], dtype=np.float32),
+                "std": np.asarray([1.0, 1.0], dtype=np.float32),
+                "min": np.asarray([0.0, 0.0], dtype=np.float32),
+                "max": np.asarray([100.0, 100.0], dtype=np.float32),
+                "count": np.asarray([30], dtype=np.int64),
+            },
+            "latent_labels.continuous_vector_latents": {
+                "mean": np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+                "std": np.asarray([[1.0, 1.1], [1.2, 1.3]], dtype=np.float32),
+                "min": np.asarray([[-1.0, -1.0], [-1.0, -1.0]], dtype=np.float32),
+                "max": np.asarray([[1.0, 1.0], [1.0, 1.0]], dtype=np.float32),
+                "count": np.asarray([[100, 100], [100, 100]], dtype=np.int64),
+            },
+        },
+    )
+
+    stats = _aggregate_selected_stats(meta, (0, 1))
+
+    assert "action" in stats
+    assert "latent_labels.continuous_vector_latents" in stats
+    np.testing.assert_allclose(
+        stats["action"]["mean"],
+        np.asarray([2.3333333, 3.3333333], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        stats["latent_labels.continuous_vector_latents"]["mean"],
+        np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
     )
 
 

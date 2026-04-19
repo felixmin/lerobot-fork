@@ -20,7 +20,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import WeightedSourceSampler
 from lerobot.datasets.utils import flatten_dict, unflatten_dict
 
-VALID_SUPERVISION_MODES = {"latent_only", "multitask"}
 logger = logging.getLogger(__name__)
 
 
@@ -32,12 +31,13 @@ def _debug_mixed_dataset() -> bool:
 class DatasetMixSourceConfig:
     name: str
     repo_id: str
+    action_supervision: bool
+    latent_supervision: bool
     root: str | None = None
     revision: str | None = None
     weight: float = 1.0
     episodes: tuple[int, ...] | None = None
     exclude_episodes: tuple[int, ...] | None = None
-    supervision: str = "multitask"
     video_backend: str | None = None
     tolerance_s: float | None = None
     feature_key_mapping: dict[str, str] | None = None
@@ -69,7 +69,8 @@ class MixedSourceMetadata:
     root: str | None
     revision: str | None
     weight: float
-    supervision: str
+    action_supervision: bool
+    latent_supervision: bool
     episodes: tuple[int, ...]
     video_backend: str | None
     tolerance_s: float
@@ -154,6 +155,14 @@ def _parse_string_list(
 def _parse_bool_field(*, field_name: str, value: bool | None, default: bool) -> bool:
     if value is None:
         return default
+    if not isinstance(value, bool):
+        raise TypeError(f"Expected '{field_name}' to be a boolean.")
+    return value
+
+
+def _parse_required_bool_field(*, field_name: str, value: Any) -> bool:
+    if value is None:
+        raise ValueError(f"Mix source is missing required boolean field '{field_name}'.")
     if not isinstance(value, bool):
         raise TypeError(f"Expected '{field_name}' to be a boolean.")
     return value
@@ -351,10 +360,25 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
             raise ValueError(
                 "A mix source cannot define both 'episodes' and 'exclude_episodes'."
             )
+        if "supervision" in raw_source:
+            source_name = str(raw_source.get("name", "<unnamed>"))
+            raise ValueError(
+                f"Mix source '{source_name}' uses removed field 'supervision'. "
+                "Use explicit boolean fields 'action_supervision' and "
+                "'latent_supervision' instead."
+            )
 
         source = DatasetMixSourceConfig(
             name=str(raw_source["name"]),
             repo_id=str(raw_source["repo_id"]),
+            action_supervision=_parse_required_bool_field(
+                field_name="action_supervision",
+                value=raw_source.get("action_supervision"),
+            ),
+            latent_supervision=_parse_required_bool_field(
+                field_name="latent_supervision",
+                value=raw_source.get("latent_supervision"),
+            ),
             root=None if raw_source.get("root") is None else str(raw_source["root"]),
             revision=(
                 None
@@ -368,7 +392,6 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
             exclude_episodes=_parse_episode_list(
                 field_name="exclude_episodes", values=raw_source.get("exclude_episodes")
             ),
-            supervision=str(raw_source["supervision"]),
             video_backend=(
                 None
                 if raw_source.get("video_backend") is None
@@ -388,11 +411,6 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
             raise ValueError(f"Duplicate mix source name '{source.name}'.")
         if source.weight <= 0:
             raise ValueError(f"Mix source '{source.name}' must have a positive weight.")
-        if source.supervision not in VALID_SUPERVISION_MODES:
-            raise ValueError(
-                f"Mix source '{source.name}' has invalid supervision '{source.supervision}'. "
-                f"Expected one of {sorted(VALID_SUPERVISION_MODES)}."
-            )
 
         seen_names.add(source.name)
         sources.append(source)
@@ -493,9 +511,20 @@ def _episode_stats(
 def _aggregate_selected_stats(
     meta: LeRobotDatasetMetadata, selected_episodes: tuple[int, ...]
 ) -> dict[str, dict[str, np.ndarray]]:
-    return aggregate_stats(
+    aggregated = aggregate_stats(
         [_episode_stats(meta, episode_index) for episode_index in selected_episodes]
     )
+
+    # Some newer feature stats may only exist at dataset level (meta.stats) and
+    # not yet be mirrored into per-episode metadata columns. Preserve the
+    # episode-selected aggregates where available, and fall back to dataset-level
+    # stats only for missing feature keys.
+    if not getattr(meta, "stats", None):
+        return aggregated
+
+    merged = deepcopy(meta.stats)
+    merged.update(aggregated)
+    return merged
 
 
 def _stats_signature(
@@ -824,8 +853,12 @@ class LogicalSource:
         return self.config.weight
 
     @property
-    def supervision(self) -> str:
-        return self.config.supervision
+    def action_supervision(self) -> bool:
+        return bool(self.config.action_supervision)
+
+    @property
+    def latent_supervision(self) -> bool:
+        return bool(self.config.latent_supervision)
 
     @property
     def num_frames(self) -> int:
@@ -842,14 +875,6 @@ class LogicalSource:
             for key, feature in self.features.items()
             if feature["dtype"] in {"image", "video"}
         ]
-
-    @property
-    def action_supervised(self) -> bool:
-        return self.supervision == "multitask"
-
-    @property
-    def latent_supervised(self) -> bool:
-        return True
 
     @property
     def dataset_identity(self) -> tuple[str, str | None, str | None]:
@@ -889,7 +914,8 @@ class LogicalSource:
             root=self.root,
             revision=self.revision,
             weight=self.weight,
-            supervision=self.supervision,
+            action_supervision=self.action_supervision,
+            latent_supervision=self.latent_supervision,
             episodes=self.selected_episodes,
             video_backend=self.config.video_backend,
             tolerance_s=self.tolerance_s,
@@ -933,9 +959,10 @@ class LogicalSource:
             )
         if _debug_mixed_dataset():
             logger.info(
-                "[mixed] source=%s supervision=%s anchor_abs=%s relative=%s",
+                "[mixed] source=%s action_supervision=%s latent_supervision=%s anchor_abs=%s relative=%s",
                 self.name,
-                self.supervision,
+                self.action_supervision,
+                self.latent_supervision,
                 int(anchor_abs_index),
                 int(relative_index),
             )
@@ -970,13 +997,12 @@ class LogicalSource:
                     continue
                 resized = _resize_visual_tensor(value, self.visual_target_size)
                 item[key] = resized
-        item["hlrp_action_supervised"] = torch.tensor(
-            self.action_supervised, dtype=torch.bool
+        item["action_supervision"] = torch.tensor(
+            self.action_supervision, dtype=torch.bool
         )
-        item["hlrp_latent_supervised"] = torch.tensor(
-            self.latent_supervised, dtype=torch.bool
+        item["latent_supervision"] = torch.tensor(
+            self.latent_supervision, dtype=torch.bool
         )
-        item["hlrp_source_name"] = self.name
         item["dataset_source_index"] = torch.tensor(
             self.source_index, dtype=torch.int64
         )
@@ -1025,7 +1051,8 @@ def _build_mixed_info(
             "root": metadata.root,
             "revision": metadata.revision,
             "weight": metadata.weight,
-            "supervision": metadata.supervision,
+            "action_supervision": metadata.action_supervision,
+            "latent_supervision": metadata.latent_supervision,
             "episodes": list(metadata.episodes),
             "video_backend": metadata.video_backend,
             "tolerance_s": metadata.tolerance_s,

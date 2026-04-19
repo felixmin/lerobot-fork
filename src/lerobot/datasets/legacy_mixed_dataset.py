@@ -98,8 +98,12 @@ class LegacyLogicalSource:
         return self.config.weight
 
     @property
-    def supervision(self) -> str:
-        return self.config.supervision
+    def action_supervision(self) -> bool:
+        return bool(self.config.action_supervision)
+
+    @property
+    def latent_supervision(self) -> bool:
+        return bool(self.config.latent_supervision)
 
     @property
     def num_frames(self) -> int:
@@ -116,14 +120,6 @@ class LegacyLogicalSource:
             for key, feature in self.features.items()
             if feature["dtype"] in {"image", "video"}
         ]
-
-    @property
-    def action_supervised(self) -> bool:
-        return self.supervision == "multitask"
-
-    @property
-    def latent_supervised(self) -> bool:
-        return True
 
     @property
     def dataset_identity(self) -> tuple[str, str | None, str | None]:
@@ -150,7 +146,8 @@ class LegacyLogicalSource:
             root=self.root,
             revision=self.revision,
             weight=self.weight,
-            supervision=self.supervision,
+            action_supervision=self.action_supervision,
+            latent_supervision=self.latent_supervision,
             episodes=self.selected_episodes,
             video_backend=self.config.video_backend,
             tolerance_s=self.tolerance_s,
@@ -194,17 +191,17 @@ class LegacyLogicalSource:
             import logging
 
             logging.getLogger(__name__).info(
-                "[legacy_mixed] source=%s supervision=%s anchor_abs=%s relative=%s",
+                "[legacy_mixed] source=%s action_supervision=%s latent_supervision=%s anchor_abs=%s relative=%s",
                 self.name,
-                self.supervision,
+                self.action_supervision,
+                self.latent_supervision,
                 int(anchor_abs_index),
                 int(relative_index),
             )
 
         item = dataset[relative_index]
-        item["hlrp_action_supervised"] = torch.tensor(self.action_supervised, dtype=torch.bool)
-        item["hlrp_latent_supervised"] = torch.tensor(self.latent_supervised, dtype=torch.bool)
-        item["hlrp_source_name"] = self.name
+        item["action_supervision"] = torch.tensor(self.action_supervision, dtype=torch.bool)
+        item["latent_supervision"] = torch.tensor(self.latent_supervision, dtype=torch.bool)
         item["dataset_source_index"] = torch.tensor(self.source_index, dtype=torch.int64)
         item["dataset_source_name"] = self.name
         item["dataset_source_repo_id"] = self.repo_id
@@ -251,7 +248,8 @@ def _build_mixed_info(
             "root": metadata.root,
             "revision": metadata.revision,
             "weight": metadata.weight,
-            "supervision": metadata.supervision,
+            "action_supervision": metadata.action_supervision,
+            "latent_supervision": metadata.latent_supervision,
             "episodes": list(metadata.episodes),
             "video_backend": metadata.video_backend,
             "tolerance_s": metadata.tolerance_s,

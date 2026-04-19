@@ -171,7 +171,6 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     index_key = {"index": batch["index"]} if "index" in batch else {}
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
-    hlrp_keys = {k: v for k, v in batch.items() if k.startswith("hlrp_")}
     source_keys = {k: v for k, v in batch.items() if k.startswith("dataset_source_")}
 
     return {
@@ -181,7 +180,6 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
         **index_key,
         **task_index_key,
         **episode_index_key,
-        **hlrp_keys,
         **source_keys,
     }
 
