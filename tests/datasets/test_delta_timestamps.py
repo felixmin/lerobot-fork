@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pytest
+from types import SimpleNamespace
 
+from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
     get_delta_indices,
@@ -136,3 +138,30 @@ def test_delta_indices(valid_delta_timestamps_factory, delta_indices_factory):
     expected_delta_indices = delta_indices_factory(min_max_range=min_max_range)
     actual_delta_indices = get_delta_indices(delta_timestamps, fps)
     assert expected_delta_indices == actual_delta_indices
+
+
+def test_resolve_delta_timestamps_supports_top_level_latent_keys():
+    cfg = SimpleNamespace(
+        observation_delta_indices=[0],
+        action_delta_indices=[0, 1, 2],
+        reward_delta_indices=None,
+        latent_delta_indices=[0, 10, 20],
+        latent_label_key="latent_labels.continuous_vector_latents",
+        latent_valid_key="latent_labels.valid",
+    )
+    ds_meta = SimpleNamespace(
+        fps=10,
+        features={
+            "observation.images.front": {},
+            "action": {},
+            "latent_labels.continuous_vector_latents": {},
+            "latent_labels.valid": {},
+        },
+    )
+
+    delta_timestamps = resolve_delta_timestamps(cfg, ds_meta)
+
+    assert delta_timestamps["observation.images.front"] == [0.0]
+    assert delta_timestamps["action"] == [0.0, 0.1, 0.2]
+    assert delta_timestamps["latent_labels.continuous_vector_latents"] == [0.0, 1.0, 2.0]
+    assert delta_timestamps["latent_labels.valid"] == [0.0, 1.0, 2.0]

@@ -70,6 +70,9 @@ def resolve_delta_timestamps(
         observation_delta_indices = cfg.get_observation_delta_indices_for_fps(
             ds_meta.fps
         )
+    latent_delta_indices = getattr(cfg, "latent_delta_indices", None)
+    latent_label_key = getattr(cfg, "latent_label_key", None)
+    latent_valid_key = getattr(cfg, "latent_valid_key", None)
 
     delta_timestamps = {}
     for key in ds_meta.features:
@@ -77,6 +80,10 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
+        if key == latent_label_key and latent_delta_indices is not None:
+            delta_timestamps[key] = [i / ds_meta.fps for i in latent_delta_indices]
+        if key == latent_valid_key and latent_delta_indices is not None:
+            delta_timestamps[key] = [i / ds_meta.fps for i in latent_delta_indices]
         if key.startswith(OBS_PREFIX) and observation_delta_indices is not None:
             delta_timestamps[key] = [
                 i / ds_meta.fps for i in observation_delta_indices
