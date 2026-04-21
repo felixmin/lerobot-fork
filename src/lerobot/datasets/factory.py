@@ -20,10 +20,17 @@ import torch
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.lerobot_dataset import (
-    LeRobotDataset,
-    LeRobotDatasetMetadata,
+from lerobot.datasets.compact_mixed_dataset import (
+    CompactMixedDataset,
+    CompactSourceAdapter,
 )
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.legacy_mixed_dataset import (
+    LegacyMixedLeRobotDataset,
+    make_legacy_mixed_dataset,
+    validate_legacy_mix_config,
+)
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mixed_dataset import (
     LogicalSource,
     MixedLeRobotDataset,
@@ -65,6 +72,9 @@ def resolve_delta_timestamps(
         observation_delta_indices = cfg.get_observation_delta_indices_for_fps(
             ds_meta.fps
         )
+    latent_delta_indices = getattr(cfg, "latent_delta_indices", None)
+    latent_label_key = getattr(cfg, "latent_label_key", None)
+    latent_valid_key = getattr(cfg, "latent_valid_key", None)
 
     delta_timestamps = {}
     configured_camera_keys = getattr(cfg, "camera_keys", None)
@@ -92,7 +102,11 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+        if key == latent_label_key and latent_delta_indices is not None:
+            delta_timestamps[key] = [i / ds_meta.fps for i in latent_delta_indices]
+        if key == latent_valid_key and latent_delta_indices is not None:
+            delta_timestamps[key] = [i / ds_meta.fps for i in latent_delta_indices]
+        if key.startswith(OBS_PREFIX) and observation_delta_indices is not None:
             if (
                 allowed_camera_keys is not None
                 and key.startswith(f"{OBS_PREFIX}images.")
@@ -106,14 +120,14 @@ def resolve_delta_timestamps(
             ):
                 continue
             delta_timestamps[key] = [
-                i / ds_meta.fps for i in cfg.observation_delta_indices
+                i / ds_meta.fps for i in observation_delta_indices
             ]
             if key.startswith(f"{OBS_PREFIX}images."):
                 selected_observation_image_keys += 1
 
     if (
         source_camera_keys is not None
-        and cfg.observation_delta_indices is not None
+        and observation_delta_indices is not None
         and selected_observation_image_keys == 0
     ):
         raise ValueError(
@@ -157,7 +171,12 @@ def _resolve_source_camera_keys(
 
 def make_dataset(
     cfg: TrainPipelineConfig,
-) -> LeRobotDataset | MixedLeRobotDataset:
+) -> (
+    LeRobotDataset
+    | MixedLeRobotDataset
+    | CompactMixedDataset
+    | LegacyMixedLeRobotDataset
+):
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -174,26 +193,27 @@ def make_dataset(
         if cfg.dataset.image_transforms.enable
         else None
     )
+    mix_implementation = str(getattr(cfg.dataset, "mix_implementation", "lerobot"))
+    resolved_mix_implementation = (
+        "current" if mix_implementation == "lerobot" else mix_implementation
+    )
 
+    # Preserve previous behavior: mixed logic is only active when mix_path is provided.
     if cfg.dataset.mix_path is not None:
         if cfg.dataset.streaming:
             raise ValueError("Mixed datasets do not support streaming mode.")
 
         mix_cfg = load_dataset_mix_config(cfg.dataset.mix_path)
         visual_target_size = getattr(cfg.policy, "image_size", None)
-        sources = []
-        shared_dataset_cache = {}
-        request_image_deltas = None
-        if cfg.policy.observation_delta_indices is not None:
-            request_image_deltas = tuple(int(x) for x in cfg.policy.observation_delta_indices)
-        global_filtering_cfg = getattr(cfg.dataset, "filtering", None)
-        for source_index, source_cfg in enumerate(mix_cfg.sources):
+        source_metas = []
+        source_delta_timestamps = []
+        for source_cfg in mix_cfg.sources:
             source_meta = LeRobotDatasetMetadata(
                 source_cfg.repo_id,
                 root=source_cfg.root,
                 revision=source_cfg.revision,
             )
-
+            source_metas.append(source_meta)
             if (
                 getattr(cfg.policy, "type", None) == "latent_smol"
                 and getattr(cfg.policy, "head_mode", None) == "latent"
@@ -207,35 +227,88 @@ def make_dataset(
                 )
 
             source_selected_camera_keys = _resolve_source_camera_keys(source_cfg, source_meta)
-            source_delta_timestamps = resolve_delta_timestamps(
+            source_delta_timestamp = resolve_delta_timestamps(
                 cfg.policy,
                 source_meta,
                 source_camera_keys=source_selected_camera_keys,
             )
-            sources.append(
-                LogicalSource(
-                    source_index=source_index,
-                    config=source_cfg,
-                    meta=source_meta,
-                    delta_timestamps=source_delta_timestamps,
-                    image_transforms=image_transforms,
-                    default_tolerance_s=cfg.tolerance_s,
-                    shared_dataset_cache=shared_dataset_cache,
-                    retained_features=mix_cfg.retained_features,
-                    visual_target_size=visual_target_size,
-                    request_image_deltas=request_image_deltas,
-                    global_filtering_cfg=global_filtering_cfg,
-                )
-            )
+            source_delta_timestamps.append(source_delta_timestamp)
 
-        dataset = MixedLeRobotDataset(
-            logical_repo_id=cfg.dataset.repo_id,
-            mix_path=mix_cfg.path,
-            sources=sources,
-            enforce_matching_fps=mix_cfg.enforce_matching_fps,
-            enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
-            allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
-        )
+        if resolved_mix_implementation == "compact_manifest":
+            sources = []
+            for source_index, (source_cfg, source_meta, source_delta_timestamp) in enumerate(
+                zip(mix_cfg.sources, source_metas, source_delta_timestamps, strict=True)
+            ):
+                sources.append(
+                    CompactSourceAdapter(
+                        source_index=source_index,
+                        config=source_cfg,
+                        meta=source_meta,
+                        delta_timestamps=source_delta_timestamp,
+                        image_transforms=image_transforms,
+                        default_tolerance_s=cfg.tolerance_s,
+                        retained_features=mix_cfg.retained_features,
+                        visual_target_size=visual_target_size,
+                    )
+                )
+
+            dataset = CompactMixedDataset(
+                logical_repo_id=cfg.dataset.repo_id,
+                mix_path=mix_cfg.path,
+                sources=sources,
+                enforce_matching_fps=mix_cfg.enforce_matching_fps,
+                enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
+                allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
+            )
+        elif resolved_mix_implementation == "legacy":
+            validate_legacy_mix_config(mix_cfg)
+            dataset = make_legacy_mixed_dataset(
+                logical_repo_id=cfg.dataset.repo_id,
+                mix_path=mix_cfg.path,
+                default_tolerance_s=cfg.tolerance_s,
+                image_transforms=image_transforms,
+                sources=mix_cfg.sources,
+                metadata_by_source=source_metas,
+                delta_timestamps_by_source=source_delta_timestamps,
+            )
+        elif resolved_mix_implementation == "current":
+            sources = []
+            shared_dataset_cache = {}
+            request_image_deltas = None
+            if cfg.policy.observation_delta_indices is not None:
+                request_image_deltas = tuple(int(x) for x in cfg.policy.observation_delta_indices)
+            global_filtering_cfg = getattr(cfg.dataset, "filtering", None)
+            for source_index, (source_cfg, source_meta, source_delta_timestamp) in enumerate(
+                zip(mix_cfg.sources, source_metas, source_delta_timestamps, strict=True)
+            ):
+                sources.append(
+                    LogicalSource(
+                        source_index=source_index,
+                        config=source_cfg,
+                        meta=source_meta,
+                        delta_timestamps=source_delta_timestamp,
+                        image_transforms=image_transforms,
+                        default_tolerance_s=cfg.tolerance_s,
+                        shared_dataset_cache=shared_dataset_cache,
+                        retained_features=mix_cfg.retained_features,
+                        visual_target_size=visual_target_size,
+                        request_image_deltas=request_image_deltas,
+                        global_filtering_cfg=global_filtering_cfg,
+                    )
+                )
+
+            dataset = MixedLeRobotDataset(
+                logical_repo_id=cfg.dataset.repo_id,
+                mix_path=mix_cfg.path,
+                sources=sources,
+                enforce_matching_fps=mix_cfg.enforce_matching_fps,
+                enforce_matching_delta_timestamps=mix_cfg.enforce_matching_delta_timestamps,
+                allow_visual_shape_mismatch=mix_cfg.allow_visual_shape_mismatch,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported dataset.mix_implementation={resolved_mix_implementation!r}"
+            )
     elif isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision

@@ -31,6 +31,7 @@ class DatasetConfig:
     # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | None = None
     mix_path: str | None = None
+    mix_implementation: str = "lerobot"
     episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(
         default_factory=ImageTransformsConfig
@@ -54,7 +55,7 @@ class DatasetConfig:
 
 @dataclass
 class WandBConfig:
-    enable: bool = False
+    enable: bool = True
     # Set to true to disable saving an artifact despite training.save_checkpoint=True
     disable_artifact: bool = False
     project: str = "lerobot"
@@ -72,6 +73,9 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Multiprocessing context for async vector environments. When left as None, LeRobot may pick
+    # an environment-specific default. For LIBERO, `spawn` is safer than `fork` with MuJoCo/OSMesa.
+    async_env_context: str | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:

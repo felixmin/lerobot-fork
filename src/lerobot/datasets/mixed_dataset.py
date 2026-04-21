@@ -15,12 +15,12 @@ import yaml
 
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.feature_utils import get_delta_indices
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import WeightedSourceSampler
 from lerobot.datasets.utils import flatten_dict, unflatten_dict
 from lerobot.utils.constants import ACTION
 
-VALID_SUPERVISION_MODES = {"latent_only", "multitask"}
 logger = logging.getLogger(__name__)
 
 
@@ -28,17 +28,17 @@ def _debug_mixed_dataset() -> bool:
     value = os.environ.get("HLRP_STAGE3_DEBUG_DATASET", "")
     return value.lower() in {"1", "true", "yes", "on"}
 
-
 @dataclass(frozen=True)
 class DatasetMixSourceConfig:
     name: str
     repo_id: str
+    action_supervision: bool
+    latent_supervision: bool
     root: str | None = None
     revision: str | None = None
     weight: float = 1.0
     episodes: tuple[int, ...] | None = None
     exclude_episodes: tuple[int, ...] | None = None
-    supervision: str = "multitask"
     video_backend: str | None = None
     tolerance_s: float | None = None
     camera_keys: tuple[str, ...] | None = None
@@ -74,7 +74,8 @@ class MixedSourceMetadata:
     root: str | None
     revision: str | None
     weight: float
-    supervision: str
+    action_supervision: bool
+    latent_supervision: bool
     episodes: tuple[int, ...]
     video_backend: str | None
     tolerance_s: float
@@ -166,6 +167,14 @@ def _parse_bool_field(*, field_name: str, value: bool | None, default: bool) -> 
     return value
 
 
+def _parse_required_bool_field(*, field_name: str, value: Any) -> bool:
+    if value is None:
+        raise ValueError(f"Mix source is missing required boolean field '{field_name}'.")
+    if not isinstance(value, bool):
+        raise TypeError(f"Expected '{field_name}' to be a boolean.")
+    return value
+
+
 def _parse_feature_key_mapping(
     *,
     field_name: str,
@@ -202,6 +211,27 @@ def _parse_feature_key_mapping(
             )
         inverse[target_key] = source_key
     return mapping
+
+
+def _infer_required_lookahead_frames(
+    delta_timestamps: dict[str, list[float]] | None,
+    *,
+    fps: int | float,
+) -> int:
+    if not delta_timestamps:
+        return 0
+
+    max_positive_seconds = 0.0
+    for timestamps in delta_timestamps.values():
+        for timestamp in timestamps:
+            max_positive_seconds = max(max_positive_seconds, float(timestamp))
+
+    if max_positive_seconds <= 0.0:
+        return 0
+
+    # Delta timestamps are resolved from integer frame offsets in the standard
+    # LeRobot path, so rounding back to frames is the least surprising inverse.
+    return max(0, int(round(max_positive_seconds * float(fps))))
 
 
 def _remap_output_key(key: str, feature_key_mapping: dict[str, str]) -> str:
@@ -337,6 +367,13 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
             raise ValueError(
                 "A mix source cannot define both 'episodes' and 'exclude_episodes'."
             )
+        if "supervision" in raw_source:
+            source_name = str(raw_source.get("name", "<unnamed>"))
+            raise ValueError(
+                f"Mix source '{source_name}' uses removed field 'supervision'. "
+                "Use explicit boolean fields 'action_supervision' and "
+                "'latent_supervision' instead."
+            )
 
         raw_camera_keys = raw_source.get("camera_keys")
         raw_camera_map = raw_source.get("camera_map")
@@ -375,6 +412,14 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
         source = DatasetMixSourceConfig(
             name=str(raw_source["name"]),
             repo_id=str(raw_source["repo_id"]),
+            action_supervision=_parse_required_bool_field(
+                field_name="action_supervision",
+                value=raw_source.get("action_supervision"),
+            ),
+            latent_supervision=_parse_required_bool_field(
+                field_name="latent_supervision",
+                value=raw_source.get("latent_supervision"),
+            ),
             root=None if raw_source.get("root") is None else str(raw_source["root"]),
             revision=(
                 None
@@ -388,7 +433,6 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
             exclude_episodes=_parse_episode_list(
                 field_name="exclude_episodes", values=raw_source.get("exclude_episodes")
             ),
-            supervision=str(raw_source["supervision"]),
             video_backend=(
                 None
                 if raw_source.get("video_backend") is None
@@ -414,11 +458,6 @@ def load_dataset_mix_config(path: str | Path) -> DatasetMixConfig:
             raise ValueError(f"Duplicate mix source name '{source.name}'.")
         if source.weight <= 0:
             raise ValueError(f"Mix source '{source.name}' must have a positive weight.")
-        if source.supervision not in VALID_SUPERVISION_MODES:
-            raise ValueError(
-                f"Mix source '{source.name}' has invalid supervision '{source.supervision}'. "
-                f"Expected one of {sorted(VALID_SUPERVISION_MODES)}."
-            )
 
         seen_names.add(source.name)
         sources.append(source)
@@ -519,9 +558,20 @@ def _episode_stats(
 def _aggregate_selected_stats(
     meta: LeRobotDatasetMetadata, selected_episodes: tuple[int, ...]
 ) -> dict[str, dict[str, np.ndarray]]:
-    return aggregate_stats(
+    aggregated = aggregate_stats(
         [_episode_stats(meta, episode_index) for episode_index in selected_episodes]
     )
+
+    # Some newer feature stats may only exist at dataset level (meta.stats) and
+    # not yet be mirrored into per-episode metadata columns. Preserve the
+    # episode-selected aggregates where available, and fall back to dataset-level
+    # stats only for missing feature keys.
+    if not getattr(meta, "stats", None):
+        return aggregated
+
+    merged = deepcopy(meta.stats)
+    merged.update(aggregated)
+    return merged
 
 
 def _stats_signature(
@@ -709,6 +759,24 @@ def build_explicit_mixed_stats(sources: list[Any]) -> dict[str, dict[str, np.nda
     return merge_weighted_stats(stats_by_source, source_weights)
 
 
+def _compute_delta_frame_bounds(
+    delta_timestamps: dict[str, list[float]] | None,
+    fps: int,
+) -> tuple[int, int]:
+    if not delta_timestamps:
+        return 0, 0
+
+    delta_indices = get_delta_indices(delta_timestamps, int(fps))
+    min_delta = 0
+    max_delta = 0
+    for deltas in delta_indices.values():
+        if not deltas:
+            continue
+        min_delta = min(min_delta, min(int(delta) for delta in deltas))
+        max_delta = max(max_delta, max(int(delta) for delta in deltas))
+    return max(0, -min_delta), max(0, max_delta)
+
+
 class LogicalSource:
     def __init__(
         self,
@@ -722,7 +790,7 @@ class LogicalSource:
         shared_dataset_cache: dict[tuple[Any, ...], LeRobotDataset] | None = None,
         request_image_deltas: tuple[int, ...] | None = None,
         global_filtering_cfg: dict[str, Any] | None = None,
-	retained_features: tuple[str, ...] | None = None,
+        retained_features: tuple[str, ...] | None = None,
         visual_target_size: tuple[int, int] | list[int] | None = None,
     ) -> None:
         self.source_index = int(source_index)
@@ -798,8 +866,16 @@ class LogicalSource:
             self.delta_timestamps = None
         if delta_timestamps is None or len(self.raw_delta_timestamps) == 0:
             self.raw_delta_timestamps = None
+        self.required_lookahead_frames = _infer_required_lookahead_frames(
+            self.raw_delta_timestamps,
+            fps=self.meta.fps,
+        )
         self.tolerance_s = float(
             default_tolerance_s if config.tolerance_s is None else config.tolerance_s
+        )
+        self._drop_n_first_frames, self._drop_n_last_frames = _compute_delta_frame_bounds(
+            self.raw_delta_timestamps,
+            self.meta.fps,
         )
         self._shared_dataset_cache = (
             {} if shared_dataset_cache is None else shared_dataset_cache
@@ -957,8 +1033,12 @@ class LogicalSource:
         return self.config.weight
 
     @property
-    def supervision(self) -> str:
-        return self.config.supervision
+    def action_supervision(self) -> bool:
+        return bool(self.config.action_supervision)
+
+    @property
+    def latent_supervision(self) -> bool:
+        return bool(self.config.latent_supervision)
 
     @property
     def num_frames(self) -> int:
@@ -979,22 +1059,23 @@ class LogicalSource:
         ]
 
     @property
-    def action_supervised(self) -> bool:
-        return self.supervision == "multitask"
-
-    @property
-    def latent_supervised(self) -> bool:
-        return True
-
-    @property
     def dataset_identity(self) -> tuple[str, str | None, str | None]:
         return (self.repo_id, str(Path(self.meta.root).resolve()), self.revision)
 
     def get_effective_lengths(self, drop_n_last_frames: int = 0) -> np.ndarray:
-        base_lengths = (
-            self._kept_counts if self._kept_counts is not None else self.index.lengths
+        if self._kept_counts is not None:
+            return np.maximum(self._kept_counts - int(drop_n_last_frames), 0)
+
+        trailing_drop = max(
+            int(self._drop_n_last_frames),
+            int(self.required_lookahead_frames),
         )
-        return np.maximum(base_lengths - int(drop_n_last_frames), 0)
+        total_drop = (
+            int(self._drop_n_first_frames)
+            + trailing_drop
+            + int(drop_n_last_frames)
+        )
+        return np.maximum(self.index.lengths - total_drop, 0)
 
     def flat_index_to_anchor(self, index: int, *, drop_n_last_frames: int = 0) -> int:
         effective_lengths = self.get_effective_lengths(drop_n_last_frames)
@@ -1006,10 +1087,15 @@ class LogicalSource:
         episode_pos = int(np.searchsorted(cumulative_lengths, index, side="right"))
         prev_total = 0 if episode_pos == 0 else int(cumulative_lengths[episode_pos - 1])
         local_offset = int(index - prev_total)
-        if self._kept_anchor_values is None or self._kept_offsets_start is None:
-            return int(self.index.dataset_from_index[episode_pos] + local_offset)
-        global_offset = int(self._kept_offsets_start[episode_pos]) + local_offset
-        return int(self._kept_anchor_values[global_offset])
+        if self._kept_anchor_values is not None and self._kept_offsets_start is not None:
+            global_offset = int(self._kept_offsets_start[episode_pos]) + local_offset
+            return int(self._kept_anchor_values[global_offset])
+
+        return int(
+            self.index.dataset_from_index[episode_pos]
+            + int(self._drop_n_first_frames)
+            + local_offset
+        )
 
     def metadata(self) -> MixedSourceMetadata:
         return MixedSourceMetadata(
@@ -1018,7 +1104,8 @@ class LogicalSource:
             root=self.root,
             revision=self.revision,
             weight=self.weight,
-            supervision=self.supervision,
+            action_supervision=self.action_supervision,
+            latent_supervision=self.latent_supervision,
             episodes=self.selected_episodes,
             video_backend=self.config.video_backend,
             tolerance_s=self.tolerance_s,
@@ -1066,9 +1153,10 @@ class LogicalSource:
             )
         if _debug_mixed_dataset():
             logger.info(
-                "[mixed] source=%s supervision=%s anchor_abs=%s relative=%s",
+                "[mixed] source=%s action_supervision=%s latent_supervision=%s anchor_abs=%s relative=%s",
                 self.name,
-                self.supervision,
+                self.action_supervision,
+                self.latent_supervision,
                 int(anchor_abs_index),
                 int(relative_index),
             )
@@ -1101,14 +1189,14 @@ class LogicalSource:
                     continue
                 if not isinstance(value, torch.Tensor):
                     continue
-                item[key] = _resize_visual_tensor(value, self.visual_target_size)
-        item["hlrp_action_supervised"] = torch.tensor(
-            self.action_supervised, dtype=torch.bool
+                resized = _resize_visual_tensor(value, self.visual_target_size)
+                item[key] = resized
+        item["action_supervision"] = torch.tensor(
+            self.action_supervision, dtype=torch.bool
         )
-        item["hlrp_latent_supervised"] = torch.tensor(
-            self.latent_supervised, dtype=torch.bool
+        item["latent_supervision"] = torch.tensor(
+            self.latent_supervision, dtype=torch.bool
         )
-        item["hlrp_source_name"] = self.name
         item["dataset_source_index"] = torch.tensor(
             self.source_index, dtype=torch.int64
         )
@@ -1157,7 +1245,8 @@ def _build_mixed_info(
             "root": metadata.root,
             "revision": metadata.revision,
             "weight": metadata.weight,
-            "supervision": metadata.supervision,
+            "action_supervision": metadata.action_supervision,
+            "latent_supervision": metadata.latent_supervision,
             "episodes": list(metadata.episodes),
             "video_backend": metadata.video_backend,
             "tolerance_s": metadata.tolerance_s,
@@ -1291,6 +1380,14 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
     def features(self) -> dict[str, dict[str, Any]]:
         return self.meta.features
 
+    def loader_hints(self) -> dict[str, Any]:
+        return {
+            "is_mixed": True,
+            "prefetch_factor": 1,
+            "sampler_mode": "source_block",
+            "mixed_impl": "current",
+        }
+
     def __len__(self) -> int:
         return self.num_frames
 
@@ -1315,7 +1412,11 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
         return self.sources[source_index].get_item(anchor_abs_index)
 
     def build_sampler(
-        self, *, seed: int | None = None, drop_n_last_frames: int = 0
+        self,
+        *,
+        seed: int | None = None,
+        drop_n_last_frames: int = 0,
+        source_block_size: int = 1,
     ) -> WeightedSourceSampler:
         num_samples = int(
             sum(
@@ -1333,4 +1434,5 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
             num_samples=num_samples,
             seed=0 if seed is None else int(seed),
             drop_n_last_frames=drop_n_last_frames,
+            source_block_size=source_block_size,
         )

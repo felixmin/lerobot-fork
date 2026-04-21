@@ -131,15 +131,32 @@ def env_to_policy_features(env_cfg: EnvConfig) -> dict[str, PolicyFeature]:
 
 
 def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
-    first_type = type(env.envs[0])  # Get type of first env
-    return all(type(e) is first_type for e in env.envs)  # Fast type check
+    if hasattr(env, "envs"):
+        first_type = type(env.envs[0])
+        return all(type(e) is first_type for e in env.envs)
+
+    # AsyncVectorEnv doesn't expose `.envs` in the parent process. In LeRobot's usage, all
+    # sub-environments are created from the same factory list for a given vector env, so assume
+    # homogeneous types instead of failing on a sync-only implementation detail.
+    return True
+
+
+def _vector_env_has_attr(env: gym.vector.VectorEnv, attr_name: str) -> bool:
+    if hasattr(env, "envs"):
+        return hasattr(env.envs[0], attr_name)
+
+    try:
+        env.call(attr_name)
+        return True
+    except (AttributeError, ValueError):
+        return False
 
 
 def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("once", UserWarning)  # Apply filter only in this function
 
-        if not (hasattr(env.envs[0], "task_description") and hasattr(env.envs[0], "task")):
+        if not (_vector_env_has_attr(env, "task_description") and _vector_env_has_attr(env, "task")):
             warnings.warn(
                 "The environment does not have 'task_description' and 'task'. Some policies require these features.",
                 UserWarning,
@@ -155,7 +172,7 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
 
 def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> RobotObservation:
     """Adds task feature to the observation dict with respect to the first environment attribute."""
-    if hasattr(env.envs[0], "task_description"):
+    if _vector_env_has_attr(env, "task_description"):
         task_result = env.call("task_description")
 
         if isinstance(task_result, tuple):
@@ -167,7 +184,7 @@ def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> R
             raise TypeError("All items in task_description result must be strings")
 
         observation["task"] = task_result
-    elif hasattr(env.envs[0], "task"):
+    elif _vector_env_has_attr(env, "task"):
         task_result = env.call("task")
 
         if isinstance(task_result, tuple):

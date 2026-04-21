@@ -33,6 +33,34 @@ class _DatasetWithSampler(torch.utils.data.Dataset):
         return self._sampler
 
 
+class _DatasetWithSourceBlockSampler(_DatasetWithSampler):
+    def loader_hints(self) -> dict[str, object]:
+        return {"is_mixed": True, "prefetch_factor": 1, "sampler_mode": "source_block"}
+
+    def build_sampler(self, *, seed: int, drop_n_last_frames: int, source_block_size: int):
+        self.called_with = (seed, drop_n_last_frames, source_block_size)
+        return self._sampler
+
+
+class _DatasetWithSampleLevelSampler(_DatasetWithSampler):
+    def loader_hints(self) -> dict[str, object]:
+        return {"is_mixed": True, "prefetch_factor": 1, "sampler_mode": "sample_level"}
+
+
+class _DatasetWithBatchAwareSampleLevelSampler(_DatasetWithSampler):
+    def loader_hints(self) -> dict[str, object]:
+        return {
+            "is_mixed": True,
+            "prefetch_factor": 1,
+            "sampler_mode": "sample_level",
+            "pass_batch_size_to_sampler": True,
+        }
+
+    def build_sampler(self, *, seed: int, drop_n_last_frames: int, batch_size: int):
+        self.called_with = (seed, drop_n_last_frames, batch_size)
+        return self._sampler
+
+
 class _FixedTupleSampler(torch.utils.data.Sampler[tuple[int, int]]):
     def __iter__(self):
         yield from [(0, 10), (1, 20), (0, 30), (1, 40)]
@@ -90,6 +118,39 @@ def test_make_offline_dataloader_prefers_dataset_owned_sampler():
 
     assert dataset.called_with == (17, 3)
     assert batch["index"].tolist() == [3, 1]
+
+
+def test_make_offline_dataloader_uses_loader_hints_for_source_block_sampler():
+    dataset = _DatasetWithSourceBlockSampler()
+    cfg = _make_test_cfg(batch_size=5)
+
+    dataloader = make_offline_dataloader(cfg, dataset, device=torch.device("cpu"))
+    batch = next(iter(dataloader))
+
+    assert dataset.called_with == (17, 3, 5)
+    assert batch["index"].tolist() == [3, 1, 2, 0]
+
+
+def test_make_offline_dataloader_does_not_pass_source_block_size_to_sample_level_sampler():
+    dataset = _DatasetWithSampleLevelSampler()
+    cfg = _make_test_cfg(batch_size=5)
+
+    dataloader = make_offline_dataloader(cfg, dataset, device=torch.device("cpu"))
+    batch = next(iter(dataloader))
+
+    assert dataset.called_with == (17, 3)
+    assert batch["index"].tolist() == [3, 1, 2, 0]
+
+
+def test_make_offline_dataloader_can_pass_batch_size_to_sample_level_sampler():
+    dataset = _DatasetWithBatchAwareSampleLevelSampler()
+    cfg = _make_test_cfg(batch_size=5)
+
+    dataloader = make_offline_dataloader(cfg, dataset, device=torch.device("cpu"))
+    batch = next(iter(dataloader))
+
+    assert dataset.called_with == (17, 3, 5)
+    assert batch["index"].tolist() == [3, 1, 2, 0]
 
 
 def test_accelerate_shards_dataset_owned_sampler_without_cross_rank_overlap():

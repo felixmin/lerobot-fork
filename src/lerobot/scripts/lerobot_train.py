@@ -317,6 +317,10 @@ def update_policy(
                     accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
+                    if has_method(unwrapped_policy, "get_gradient_metrics"):
+                        if output_dict_local is None:
+                            output_dict_local = {}
+                        output_dict_local.update(unwrapped_policy.get_gradient_metrics())
                     if grad_clip_norm > 0:
                         grad_norm = accelerator.clip_grad_norm_(
                             policy.parameters(), grad_clip_norm
@@ -457,12 +461,20 @@ def make_offline_dataloader(
     drop_n_last_frames = int(getattr(cfg.policy, "drop_n_last_frames", 0))
     sampler = None
     shuffle = True
+    loader_hints = dataset.loader_hints() if has_method(dataset, "loader_hints") else {}
+    is_mixed_dataset = bool(loader_hints.get("is_mixed", False))
+    prefetch_factor = int(loader_hints.get("prefetch_factor", 2))
 
     if hasattr(dataset, "build_sampler"):
-        sampler = dataset.build_sampler(
+        sampler_kwargs = dict(
             seed=0 if cfg.seed is None else int(cfg.seed),
             drop_n_last_frames=drop_n_last_frames,
         )
+        if loader_hints.get("sampler_mode") == "source_block":
+            sampler_kwargs["source_block_size"] = max(1, int(cfg.batch_size))
+        if loader_hints.get("pass_batch_size_to_sampler"):
+            sampler_kwargs["batch_size"] = max(1, int(cfg.batch_size))
+        sampler = dataset.build_sampler(**sampler_kwargs)
         shuffle = False
     elif hasattr(cfg.policy, "drop_n_last_frames"):
         sampler = EpisodeAwareSampler(
@@ -482,7 +494,7 @@ def make_offline_dataloader(
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if cfg.num_workers > 0 else None,
     )
 
 
@@ -570,7 +582,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
         eval_env = make_env(
-            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+            cfg.env,
+            n_envs=cfg.eval.batch_size,
+            use_async_envs=cfg.eval.use_async_envs,
+            async_env_context=cfg.eval.async_env_context,
         )
 
     if is_main_process:
