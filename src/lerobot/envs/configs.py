@@ -30,13 +30,36 @@ from lerobot.utils.constants import (
     LIBERO_KEY_GRIPPER_QVEL,
     LIBERO_KEY_JOINTS_POS,
     LIBERO_KEY_JOINTS_VEL,
-    LIBERO_KEY_PIXELS_AGENTVIEW,
-    LIBERO_KEY_PIXELS_EYE_IN_HAND,
     OBS_ENV_STATE,
     OBS_IMAGE,
     OBS_IMAGES,
     OBS_STATE,
 )
+
+
+def _parse_libero_camera_names(camera_name: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(camera_name, str):
+        cams = [cam.strip() for cam in camera_name.split(",") if cam.strip()]
+    else:
+        cams = [str(cam).strip() for cam in camera_name if str(cam).strip()]
+    if not cams:
+        raise ValueError("camera_name resolved to an empty list.")
+    return cams
+
+
+def _default_libero_camera_name_mapping(camera_names: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for idx, cam in enumerate(camera_names):
+        if cam in {"agentview_image", "frontview_image"}:
+            target = "image"
+        elif cam == "robot0_eye_in_hand_image":
+            target = "image2"
+        elif cam == "sideview_image":
+            target = "wrist_image"
+        else:
+            target = "image" if idx == 0 else f"image{idx + 1}"
+        mapping[cam] = target
+    return mapping
 
 
 @dataclass
@@ -286,27 +309,30 @@ class LiberoEnv(EnvConfig):
             LIBERO_KEY_GRIPPER_QVEL: f"{OBS_STATE}.gripper_qvel",
             LIBERO_KEY_JOINTS_POS: f"{OBS_STATE}.joint_pos",
             LIBERO_KEY_JOINTS_VEL: f"{OBS_STATE}.joint_vel",
-            LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
-            LIBERO_KEY_PIXELS_EYE_IN_HAND: f"{OBS_IMAGES}.image2",
         }
     )
     control_mode: str = "relative"  # or "absolute"
 
     def __post_init__(self):
+        camera_names = _parse_libero_camera_names(self.camera_name)
+        default_camera_mapping = _default_libero_camera_name_mapping(camera_names)
+        if self.camera_name_mapping is None:
+            self.camera_name_mapping = default_camera_mapping
+        else:
+            self.camera_name_mapping = {**default_camera_mapping, **self.camera_name_mapping}
+
         if self.obs_type == "pixels":
-            self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
-            self.features[LIBERO_KEY_PIXELS_EYE_IN_HAND] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
+            for camera_name in camera_names:
+                self.features[f"pixels/{camera_name}"] = PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+                )
+                self.features_map[f"pixels/{camera_name}"] = f"{OBS_IMAGES}.{self.camera_name_mapping[camera_name]}"
         elif self.obs_type == "pixels_agent_pos":
-            self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
-            self.features[LIBERO_KEY_PIXELS_EYE_IN_HAND] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
+            for camera_name in camera_names:
+                self.features[f"pixels/{camera_name}"] = PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
+                )
+                self.features_map[f"pixels/{camera_name}"] = f"{OBS_IMAGES}.{self.camera_name_mapping[camera_name]}"
             self.features[LIBERO_KEY_EEF_POS] = PolicyFeature(
                 type=FeatureType.STATE,
                 shape=(3,),
@@ -343,6 +369,8 @@ class LiberoEnv(EnvConfig):
         kwargs: dict[str, Any] = {"obs_type": self.obs_type, "render_mode": self.render_mode}
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        if self.camera_name_mapping is not None:
+            kwargs["camera_name_mapping"] = self.camera_name_mapping
         return kwargs
 
 

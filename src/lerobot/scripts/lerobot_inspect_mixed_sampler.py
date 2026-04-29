@@ -58,6 +58,7 @@ def _build_training_style_sampler(
     *,
     seed: int,
     batch_size: int,
+    source_block_size: int | None,
     drop_n_last_frames: int,
 ):
     if not hasattr(dataset, "build_sampler"):
@@ -76,7 +77,10 @@ def _build_training_style_sampler(
         "drop_n_last_frames": int(drop_n_last_frames),
     }
     if loader_hints.get("sampler_mode") == "source_block":
-        sampler_kwargs["source_block_size"] = max(1, int(batch_size))
+        sampler_kwargs["source_block_size"] = max(
+            1,
+            int(batch_size if source_block_size is None else source_block_size),
+        )
     if loader_hints.get("pass_batch_size_to_sampler"):
         sampler_kwargs["batch_size"] = max(1, int(batch_size))
 
@@ -309,6 +313,15 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--source-block-size",
+        type=int,
+        default=None,
+        help=(
+            "Override source-block size for source-block mixed samplers. "
+            "Defaults to --batch-size, matching training's historical behavior."
+        ),
+    )
     parser.add_argument("--num-samples", type=int, default=32)
     parser.add_argument(
         "--show-items",
@@ -359,6 +372,7 @@ def main() -> None:
         dataset,
         seed=args.seed,
         batch_size=args.batch_size,
+        source_block_size=args.source_block_size,
         drop_n_last_frames=args.drop_n_last_frames,
     )
 

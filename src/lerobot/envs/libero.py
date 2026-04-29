@@ -46,6 +46,25 @@ def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
     return cams
 
 
+def _default_camera_name_mapping(camera_names: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for idx, cam in enumerate(camera_names):
+        if cam in {"agentview_image", "frontview_image"}:
+            target = "image"
+        elif cam == "robot0_eye_in_hand_image":
+            target = "image2"
+        elif cam == "sideview_image":
+            target = "wrist_image"
+        else:
+            target = "image" if idx == 0 else f"image{idx + 1}"
+        mapping[cam] = target
+    return mapping
+
+
+def _raw_camera_name_to_render_camera(camera_name: str) -> str:
+    return camera_name.removesuffix("_image")
+
+
 def _get_suite(name: str) -> benchmark.Benchmark:
     """Instantiate a LIBERO suite by name with clear validation."""
     bench = benchmark.get_benchmark_dict()
@@ -152,11 +171,11 @@ class LiberoEnv(gym.Env):
         # following the LeRobot convention (e.g., `observation.images.image`, `observation.images.image2`).
         # This ensures the policy consistently receives observations in the
         # expected format regardless of the original camera naming.
+        default_camera_mapping = _default_camera_name_mapping(self.camera_name)
         if camera_name_mapping is None:
-            camera_name_mapping = {
-                "agentview_image": "image",
-                "robot0_eye_in_hand_image": "image2",
-            }
+            camera_name_mapping = default_camera_mapping
+        else:
+            camera_name_mapping = {**default_camera_mapping, **camera_name_mapping}
         self.camera_name_mapping = camera_name_mapping
         self.num_steps_wait = num_steps_wait
         self.episode_index = episode_index
@@ -241,7 +260,8 @@ class LiberoEnv(gym.Env):
 
     def render(self):
         raw_obs = self._env.env._get_observations()
-        image = self._format_raw_obs(raw_obs)["pixels"]["image"]
+        pixels = self._format_raw_obs(raw_obs)["pixels"]
+        image = pixels["image"] if "image" in pixels else next(iter(pixels.values()))
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
 
@@ -255,6 +275,7 @@ class LiberoEnv(gym.Env):
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            "camera_names": [_raw_camera_name_to_render_camera(cam) for cam in self.camera_name],
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()

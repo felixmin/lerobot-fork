@@ -471,7 +471,12 @@ def make_offline_dataloader(
             drop_n_last_frames=drop_n_last_frames,
         )
         if loader_hints.get("sampler_mode") == "source_block":
-            sampler_kwargs["source_block_size"] = max(1, int(cfg.batch_size))
+            source_block_size = (
+                cfg.batch_size
+                if cfg.mixed_source_block_size is None
+                else cfg.mixed_source_block_size
+            )
+            sampler_kwargs["source_block_size"] = max(1, int(source_block_size))
         if loader_hints.get("pass_batch_size_to_sampler"):
             sampler_kwargs["batch_size"] = max(1, int(cfg.batch_size))
         sampler = dataset.build_sampler(**sampler_kwargs)

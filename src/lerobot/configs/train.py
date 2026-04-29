@@ -57,6 +57,9 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # For mixed datasets with source-block sampling, this controls how many consecutive samples are
+    # drawn from the same source. If unset, the dataloader keeps the previous behavior: one source per batch.
+    mixed_source_block_size: int | None = None
     # Gradient accumulation steps. Effective batch size per optimizer update is:
     # batch_size * grad_accum_steps * num_processes.
     grad_accum_steps: int = 1

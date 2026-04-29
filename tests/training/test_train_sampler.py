@@ -87,9 +87,13 @@ class _TupleDatasetWithSampler(torch.utils.data.Dataset):
         return self._sampler
 
 
-def _make_test_cfg(batch_size: int = 2) -> SimpleNamespace:
+def _make_test_cfg(
+    batch_size: int = 2,
+    mixed_source_block_size: int | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         batch_size=batch_size,
+        mixed_source_block_size=mixed_source_block_size,
         num_workers=0,
         seed=17,
         dataset=SimpleNamespace(streaming=False),
@@ -128,6 +132,17 @@ def test_make_offline_dataloader_uses_loader_hints_for_source_block_sampler():
     batch = next(iter(dataloader))
 
     assert dataset.called_with == (17, 3, 5)
+    assert batch["index"].tolist() == [3, 1, 2, 0]
+
+
+def test_make_offline_dataloader_can_override_source_block_size():
+    dataset = _DatasetWithSourceBlockSampler()
+    cfg = _make_test_cfg(batch_size=32, mixed_source_block_size=8)
+
+    dataloader = make_offline_dataloader(cfg, dataset, device=torch.device("cpu"))
+    batch = next(iter(dataloader))
+
+    assert dataset.called_with == (17, 3, 8)
     assert batch["index"].tolist() == [3, 1, 2, 0]
 
 
