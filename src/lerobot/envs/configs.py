@@ -267,6 +267,9 @@ class LiberoEnv(EnvConfig):
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
+    # When True, `camera_name` is forwarded into OffScreenRenderEnv as robosuite `camera_names`
+    # (required for multi-view / custom LIBERO forks). Default True for multicam workflows
+    pass_camera_names_to_libero_env: bool = True
     init_states: bool = True
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
@@ -340,9 +343,17 @@ class LiberoEnv(EnvConfig):
 
     @property
     def gym_kwargs(self) -> dict:
-        kwargs: dict[str, Any] = {"obs_type": self.obs_type, "render_mode": self.render_mode}
+        kwargs: dict[str, Any] = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_width": self.observation_width,
+            "observation_height": self.observation_height,
+        }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        kwargs["pass_camera_names_to_libero_env"] = self.pass_camera_names_to_libero_env
+        if self.camera_name_mapping is not None:
+            kwargs["camera_name_mapping"] = dict(self.camera_name_mapping)
         return kwargs
 
 

@@ -47,6 +47,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
+    # Optional: intersect with mix `camera_map` when resolving video delta timestamps (SmolVLA has no LAM-style default).
+    camera_keys: list[str] | None = None
+
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0

@@ -133,6 +133,7 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
         control_mode: str = "relative",
+        pass_camera_names_to_libero_env: bool = True,
     ):
         super().__init__()
         self.task_id = task_id
@@ -159,6 +160,7 @@ class LiberoEnv(gym.Env):
             }
         self.camera_name_mapping = camera_name_mapping
         self.num_steps_wait = num_steps_wait
+        self.pass_camera_names_to_libero_env = pass_camera_names_to_libero_env
         self.episode_index = episode_index
         self.episode_length = episode_length
         # Load once and keep
@@ -241,7 +243,10 @@ class LiberoEnv(gym.Env):
 
     def render(self):
         raw_obs = self._env.env._get_observations()
-        image = self._format_raw_obs(raw_obs)["pixels"]["image"]
+        pixels = self._format_raw_obs(raw_obs)["pixels"]
+        # Pixels keys follow `camera_name_mapping` (e.g. legacy `image` or native `frontview_image`).
+        primary = self.camera_name_mapping[self.camera_name[0]]
+        image = pixels[primary]
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
 
@@ -256,6 +261,16 @@ class LiberoEnv(gym.Env):
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
         }
+        if self.pass_camera_names_to_libero_env:
+            # Robosuite / LIBERO use camera names without the `_image` suffix (e.g. "frontview"),
+            # while flattened observations expose keys like "frontview_image".
+            robosuite_camera_names: list[str] = []
+            for c in self.camera_name:
+                if c.endswith("_image"):
+                    robosuite_camera_names.append(c[: -len("_image")])
+                else:
+                    robosuite_camera_names.append(c)
+            env_args["camera_names"] = robosuite_camera_names
         env = OffScreenRenderEnv(**env_args)
         env.reset()
         return env

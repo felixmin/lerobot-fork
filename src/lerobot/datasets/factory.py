@@ -115,6 +115,7 @@ def resolve_delta_timestamps(
                 continue
             if (
                 visual_input_keys is not None
+                and len(visual_input_keys) > 0
                 and key.startswith(f"{OBS_PREFIX}images.")
                 and key not in visual_input_keys
             ):

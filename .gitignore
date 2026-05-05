@@ -178,3 +178,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+configs/mixes/libero_additionalCams_all.yaml
+configs/mixes/stage1_teleop_v1_multicam.yaml
+configs/train/*
