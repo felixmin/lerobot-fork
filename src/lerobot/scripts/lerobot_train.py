@@ -15,8 +15,10 @@
 # limitations under the License.
 import dataclasses
 import datetime as dt
+import json
 import logging
 import time
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -54,6 +56,7 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
 def _merge_microbatch_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[str, float]:
@@ -205,6 +208,36 @@ def _accelerator_kwargs_handlers(cfg: TrainPipelineConfig) -> list[Any]:
             )
         )
     return kwargs_handlers
+
+
+def _load_saved_processor_step_names(
+    pretrained_path: str | Path | None,
+    processor_name: str,
+) -> set[str] | None:
+    if pretrained_path is None:
+        return None
+
+    path = Path(pretrained_path)
+    if not path.is_dir():
+        return None
+
+    config_path = path / f"{processor_name}.json"
+    if not config_path.is_file():
+        return None
+
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except Exception as exc:
+        logging.warning("Failed to read processor config %s: %s", config_path, exc)
+        return None
+
+    step_names: set[str] = set()
+    for step_cfg in config.get("steps", []):
+        step_name = step_cfg.get("registry_name")
+        if isinstance(step_name, str):
+            step_names.add(step_name)
+    return step_names
 
 
 def _compute_loss_and_output_dict(
@@ -624,12 +657,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
-        processor_kwargs["preprocessor_overrides"] = {
-            "device_processor": {"device": device.type},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        }
-        if not cfg.resume:
-            processor_kwargs["preprocessor_overrides"]["normalizer_processor"] = {
+        preprocessor_step_names = _load_saved_processor_step_names(
+            cfg.policy.pretrained_path, POLICY_PREPROCESSOR_DEFAULT_NAME
+        )
+        postprocessor_step_names = _load_saved_processor_step_names(
+            cfg.policy.pretrained_path, POLICY_POSTPROCESSOR_DEFAULT_NAME
+        )
+
+        preprocessor_overrides: dict[str, Any] = {}
+        if preprocessor_step_names is None or "device_processor" in preprocessor_step_names:
+            preprocessor_overrides["device_processor"] = {"device": device.type}
+        if (
+            preprocessor_step_names is None
+            or "rename_observations_processor" in preprocessor_step_names
+        ):
+            preprocessor_overrides["rename_observations_processor"] = {"rename_map": cfg.rename_map}
+
+        if not cfg.resume and (
+            preprocessor_step_names is None or "normalizer_processor" in preprocessor_step_names
+        ):
+            preprocessor_overrides["normalizer_processor"] = {
                 "stats": dataset.meta.stats,
                 "features": {
                     **policy.config.input_features,
@@ -637,6 +684,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 },
                 "norm_map": policy.config.normalization_mapping,
             }
+        processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
+
+        if not cfg.resume and (
+            postprocessor_step_names is None or "unnormalizer_processor" in postprocessor_step_names
+        ):
             postprocessor_kwargs["postprocessor_overrides"] = {
                 "unnormalizer_processor": {
                     "stats": dataset.meta.stats,

@@ -529,11 +529,29 @@ def _aggregate_selected_stats(
 
 def _stats_signature(
     stats: dict[str, dict[str, np.ndarray]],
-) -> dict[str, tuple[int, ...]]:
-    return {
-        key: tuple(np.asarray(value).shape)
-        for key, value in flatten_dict(stats).items()
-    }
+    *,
+    features: dict[str, dict[str, Any]] | None = None,
+    allow_visual_shape_mismatch: bool = False,
+) -> dict[str, tuple[Any, ...]]:
+    signature: dict[str, tuple[Any, ...]] = {}
+    visual_required_stats = {"mean", "std", "min", "max"}
+    for feature_key, feature_stats in stats.items():
+        feature = None if features is None else features.get(feature_key)
+        if (
+            allow_visual_shape_mismatch
+            and feature is not None
+            and feature.get("dtype") in {"image", "video"}
+            and visual_required_stats.issubset(feature_stats)
+        ):
+            # Visual datasets commonly disagree on per-channel stats layout
+            # ((3,), (3, 1, 1), optional quantiles). The image loader/model only
+            # needs a compatible visual feature here, not identical stat tensors.
+            signature[feature_key] = ("visual_stats",)
+            continue
+
+        for stat_key, value in feature_stats.items():
+            signature[f"{feature_key}/{stat_key}"] = tuple(np.asarray(value).shape)
+    return signature
 
 
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:
@@ -1089,7 +1107,11 @@ def validate_mixed_sources(
     base_fps = base_source.meta.fps
     base_delta_timestamps = base_source.delta_timestamps
     base_camera_keys = base_source.camera_keys
-    base_stats_signature = _stats_signature(base_source.stats)
+    base_stats_signature = _stats_signature(
+        base_source.stats,
+        features=base_source.features,
+        allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+    )
 
     seen_episodes: dict[tuple[str, str | None, str | None], set[int]] = {}
     for source in sources:
@@ -1114,7 +1136,14 @@ def validate_mixed_sources(
             raise ValueError(
                 "All mix sources must resolve to identical delta timestamps."
             )
-        if _stats_signature(source.stats) != base_stats_signature:
+        if (
+            _stats_signature(
+                source.stats,
+                features=source.features,
+                allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+            )
+            != base_stats_signature
+        ):
             raise ValueError(
                 "All mix sources must expose compatible normalization-stat schemas."
             )

@@ -15,6 +15,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.mixed_dataset import (
     MixedLeRobotDataset,
     _aggregate_selected_stats,
+    _stats_signature,
     build_explicit_mixed_stats,
     load_dataset_mix_config,
 )
@@ -620,6 +621,55 @@ def test_aggregate_selected_stats_falls_back_to_dataset_level_stats_for_missing_
     np.testing.assert_allclose(
         stats["latent_labels.continuous_vector_latents"]["mean"],
         np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+    )
+
+
+def test_visual_stats_signature_allows_shape_mismatch_when_visual_mismatch_is_allowed():
+    features = {
+        "observation.images.image": {"dtype": "video", "shape": (3, 256, 256)},
+        "observation.state": {"dtype": "float32", "shape": (3,)},
+    }
+    stats_a = {
+        "observation.images.image": {
+            "mean": np.zeros((3, 1, 1), dtype=np.float32),
+            "std": np.ones((3, 1, 1), dtype=np.float32),
+            "min": np.zeros((3, 1, 1), dtype=np.float32),
+            "max": np.ones((3, 1, 1), dtype=np.float32),
+            "count": np.asarray([10], dtype=np.int64),
+            "q01": np.zeros((3, 1, 1), dtype=np.float32),
+        },
+        "observation.state": {
+            "mean": np.zeros((3,), dtype=np.float32),
+            "std": np.ones((3,), dtype=np.float32),
+            "min": np.zeros((3,), dtype=np.float32),
+            "max": np.ones((3,), dtype=np.float32),
+        },
+    }
+    stats_b = {
+        "observation.images.image": {
+            "mean": np.zeros((3,), dtype=np.float32),
+            "std": np.ones((3,), dtype=np.float32),
+            "min": np.zeros((3,), dtype=np.float32),
+            "max": np.ones((3,), dtype=np.float32),
+            "count": np.asarray([20], dtype=np.int64),
+        },
+        "observation.state": {
+            "mean": np.zeros((3,), dtype=np.float32),
+            "std": np.ones((3,), dtype=np.float32),
+            "min": np.zeros((3,), dtype=np.float32),
+            "max": np.ones((3,), dtype=np.float32),
+        },
+    }
+
+    assert _stats_signature(stats_a) != _stats_signature(stats_b)
+    assert _stats_signature(
+        stats_a,
+        features=features,
+        allow_visual_shape_mismatch=True,
+    ) == _stats_signature(
+        stats_b,
+        features=features,
+        allow_visual_shape_mismatch=True,
     )
 
 

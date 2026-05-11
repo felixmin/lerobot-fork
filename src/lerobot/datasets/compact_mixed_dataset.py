@@ -746,7 +746,11 @@ def validate_compact_sources(
     base_fps = base_source.meta.fps
     base_delta_timestamps = base_source.delta_timestamps
     base_camera_keys = base_source.camera_keys
-    base_stats_signature = _stats_signature(base_source.stats)
+    base_stats_signature = _stats_signature(
+        base_source.stats,
+        features=base_source.features,
+        allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+    )
 
     seen_episodes: dict[tuple[str, str | None, str | None], set[int]] = {}
     for source in sources:
@@ -771,7 +775,14 @@ def validate_compact_sources(
             raise ValueError(
                 "All mix sources must resolve to identical delta timestamps."
             )
-        if _stats_signature(source.stats) != base_stats_signature:
+        if (
+            _stats_signature(
+                source.stats,
+                features=source.features,
+                allow_visual_shape_mismatch=allow_visual_shape_mismatch,
+            )
+            != base_stats_signature
+        ):
             raise ValueError(
                 "All mix sources must expose compatible normalization-stat schemas."
             )
