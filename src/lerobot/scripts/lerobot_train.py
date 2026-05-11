@@ -29,8 +29,10 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.configs import parser
+from lerobot.configs.types import FeatureType
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -57,6 +59,21 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+
+def _restrict_policy_visual_features_to_loaded_videos(cfg: TrainPipelineConfig, dataset) -> None:
+    video_keys_to_load = getattr(cfg.dataset, "video_keys_to_load", None)
+    if video_keys_to_load is None or cfg.policy.input_features:
+        return
+
+    selected_video_keys = set(video_keys_to_load)
+    features = dataset_to_policy_features(dataset.meta.features)
+    cfg.policy.input_features = {
+        key: feature
+        for key, feature in features.items()
+        if feature.type is not FeatureType.ACTION
+        and (feature.type is not FeatureType.VISUAL or key in selected_video_keys)
+    }
 
 
 def _merge_microbatch_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[str, float]:
@@ -625,6 +642,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             use_async_envs=cfg.eval.use_async_envs,
             async_env_context=cfg.eval.async_env_context,
         )
+
+    _restrict_policy_visual_features_to_loaded_videos(cfg, dataset)
 
     if is_main_process:
         logging.info("Creating policy")

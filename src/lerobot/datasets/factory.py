@@ -226,6 +226,7 @@ def make_dataset(
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
+                video_keys_to_load=cfg.dataset.video_keys_to_load,
                 tolerance_s=cfg.tolerance_s,
             )
         else:

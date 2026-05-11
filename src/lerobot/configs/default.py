@@ -38,6 +38,8 @@ class DatasetConfig:
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
+    # Optional decode filter for video datasets. None preserves the current behavior of loading all cameras.
+    video_keys_to_load: list[str] | None = None
     streaming: bool = False
 
     def __post_init__(self) -> None:

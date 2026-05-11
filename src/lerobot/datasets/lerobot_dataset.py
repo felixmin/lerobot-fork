@@ -108,6 +108,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        video_keys_to_load: list[str] | None = None,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
         streaming_encoding: bool = False,
@@ -223,6 +224,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 True.
             video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            video_keys_to_load (list[str] | None, optional): Video feature keys to decode in __getitem__.
+                If None, all dataset video keys are decoded. Defaults to None.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
             vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
@@ -265,6 +268,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
+        self.video_keys_to_load = self._resolve_video_keys_to_load(video_keys_to_load)
 
         # Track dataset state for efficient incremental writing
         self._lazy_loading = False
@@ -311,6 +315,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 queue_maxsize=encoder_queue_maxsize,
                 encoder_threads=encoder_threads,
             )
+
+    def _resolve_video_keys_to_load(self, video_keys_to_load: list[str] | None) -> list[str]:
+        if video_keys_to_load is None:
+            return list(self.meta.video_keys)
+
+        requested = list(video_keys_to_load)
+        unknown = sorted(set(requested).difference(self.meta.video_keys))
+        if unknown:
+            raise ValueError(
+                f"Unknown video_keys_to_load for dataset {self.repo_id}: {unknown}. "
+                f"Available video keys: {list(self.meta.video_keys)}"
+            )
+        if len(requested) != len(set(requested)):
+            duplicates = sorted({key for key in requested if requested.count(key) > 1})
+            raise ValueError(f"video_keys_to_load contains duplicates: {duplicates}")
+        return requested
 
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
@@ -536,7 +556,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
+        for key in self.video_keys_to_load:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
@@ -627,15 +647,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self.meta.video_keys) > 0:
+        if len(self.video_keys_to_load) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
+            image_keys_to_transform = [
+                cam for cam in self.meta.camera_keys if cam not in self.meta.video_keys or cam in self.video_keys_to_load
+            ]
+            for cam in image_keys_to_transform:
                 item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string
