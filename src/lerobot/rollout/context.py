@@ -46,6 +46,7 @@ from lerobot.processor import (
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
+from lerobot.utils.constants import ACTION
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
 from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
@@ -298,11 +299,17 @@ def build_rollout_context(
     )
     dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
     hw_features = hw_to_dataset_features(observation_features_hw, "observation")
-    raw_action_keys = list(action_features_hw.keys())
+    # Map policy tensor outputs to the PROCESSED (post-pipeline) action names that
+    # make_robot_action emits — for EE rollouts these are ee.* keys, not the raw
+    # joint_*.pos hw keys. Using the raw keys mismatches the engine's action dict
+    # and raises KeyError('joint_1.pos') in the sync_relative engine.
+    processed_action_keys = action_dataset_features.get(ACTION, {}).get("names") or list(
+        action_features_hw.keys()
+    )
     policy_action_names = getattr(policy_config, "action_feature_names", None)
     ordered_action_keys = _resolve_action_key_order(
         list(policy_action_names) if policy_action_names else None,
-        raw_action_keys,
+        list(processed_action_keys),
     )
 
     # Validate visual features if no rename_map is active
