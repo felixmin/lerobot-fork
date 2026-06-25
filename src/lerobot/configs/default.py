@@ -16,8 +16,8 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.datasets.transforms import ImageTransformsConfig
-from lerobot.datasets.video_utils import get_safe_default_codec
+from lerobot.transforms import ImageTransformsConfig
+from lerobot.utils.import_utils import get_safe_default_video_backend
 
 
 @dataclass
@@ -27,7 +27,8 @@ class DatasetConfig:
     # "dataset_index" into the returned item. The index mapping is made according to the order in which the
     # datasets are provided.
     repo_id: str
-    # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
+    # Root directory for a concrete local dataset tree (e.g. 'dataset/path'). If None, local datasets are
+    # looked up under $HF_LEROBOT_HOME/repo_id and Hub downloads use a revision-safe cache under $HF_LEROBOT_HOME/hub.
     root: str | None = None
     mix_path: str | None = None
     mix_implementation: str = "lerobot"
@@ -37,12 +38,19 @@ class DatasetConfig:
     )
     revision: str | None = None
     use_imagenet_stats: bool = True
-    video_backend: str = field(default_factory=get_safe_default_codec)
+    video_backend: str = field(default_factory=get_safe_default_video_backend)
     # Optional decode filter for video datasets. None preserves the current behavior of loading all cameras.
     video_keys_to_load: list[str] | None = None
+    # When True, video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).
+    # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
+    return_uint8: bool = False
     streaming: bool = False
+    # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
+    eval_split: float = 0.0
 
     def __post_init__(self) -> None:
+        if not (0.0 <= self.eval_split < 1.0):
+            raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(
@@ -70,23 +78,38 @@ class WandBConfig:
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
-    batch_size: int = 50
+    # Set to 0 for auto-tuning based on available CPU cores and n_episodes.
+    batch_size: int = 0
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
+    # Custom default: kept False for our LIBERO/cluster eval setup. Upstream defaults to True and
+    # automatically downgrades to SyncVectorEnv when batch_size=1; its lazy AsyncVectorEnv now makes
+    # async eval fork-safe (superseding our former `async_env_context` spawn workaround).
     use_async_envs: bool = False
-    # Multiprocessing context for async vector environments. When left as None, LeRobot may pick
-    # an environment-specific default. For LIBERO, `spawn` is safer than `fork` with MuJoCo/OSMesa.
-    async_env_context: str | None = None
+    # Whether to record eval rollouts as a LeRobot dataset on disk.
+    recording: bool = False
+    # If set, push recorded eval datasets to the Hub under this repo id (one repo per task,
+    # suffixed by task and env index). Requires recording=true.
+    recording_repo_id: str | None = None
+    # Whether the pushed recording repositories should be private.
+    recording_private: bool = False
 
     def __post_init__(self) -> None:
+        if self.recording_repo_id is not None and not self.recording:
+            raise ValueError("eval.recording_repo_id requires eval.recording=true.")
+        if self.batch_size == 0:
+            self.batch_size = self._auto_batch_size()
         if self.batch_size > self.n_episodes:
-            raise ValueError(
-                "The eval batch size is greater than the number of eval episodes "
-                f"({self.batch_size} > {self.n_episodes}). As a result, {self.batch_size} "
-                f"eval environments will be instantiated, but only {self.n_episodes} will be used. "
-                "This might significantly slow down evaluation. To fix this, you should update your command "
-                f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
-                f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
-            )
+            self.batch_size = self.n_episodes
+
+    def _auto_batch_size(self) -> int:
+        """Pick batch_size based on CPU cores, capped by n_episodes."""
+        import math
+        import os
+
+        cpu_cores = os.cpu_count() or 4
+        # Each async env worker needs ~1 core; leave headroom for main process + inference.
+        by_cpu = max(1, math.floor(cpu_cores * 0.7))
+        return min(by_cpu, self.n_episodes, 64)
 
 
 @dataclass
@@ -115,3 +138,9 @@ class PeftConfig:
     # the rank used for the adapter. In general a higher rank means more trainable parameters and closer to full
     # fine-tuning.
     r: int = 16
+
+    # Alpha parameter for LoRA scaling (scaling = lora_alpha / r).
+    # In general, a higher alpha means stronger adaptation signal.
+    # If None, the PEFT library defaults to alpha=8, which may dampen high-rank adapters.
+    # Common values are r (alpha == rank) or 2*r.
+    lora_alpha: int | None = None

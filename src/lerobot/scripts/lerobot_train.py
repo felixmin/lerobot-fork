@@ -13,55 +13,135 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Train a policy.
+
+Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wandb extras)
+"""
+
 import dataclasses
 import datetime as dt
-import json
 import logging
 import time
-from pathlib import Path
+from contextlib import nullcontext
 from pprint import pformat
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 import torch
-from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
 from tqdm import tqdm
 
-from lerobot.configs import parser
-from lerobot.configs.types import FeatureType
-from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.feature_utils import dataset_to_policy_features
-from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
-from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.utils import close_envs
-from lerobot.optim.factory import make_optimizer_and_scheduler
-from lerobot.policies.factory import make_policy, make_pre_post_processors
-from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.scripts.lerobot_eval import eval_policy_all
-from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
+from lerobot.common.train_utils import (
+    gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_fsdp_optimizer_state,
+    load_training_batch_size,
+    load_training_num_processes,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.common.wandb_utils import WandBLogger
+from lerobot.configs import parser
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.configs.types import FeatureType
+from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.feature_utils import dataset_to_policy_features
+from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
+from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.rewards import make_reward_pre_post_processors
+from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
+    cycle,
     format_big_number,
     has_method,
     init_logging,
     inside_slurm,
 )
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+from .lerobot_eval import eval_policy_all
+
+
+def make_offline_dataloader(
+    cfg: TrainPipelineConfig,
+    dataset,
+    *,
+    device: torch.device,
+) -> torch.utils.data.DataLoader:
+    """Create the offline-training dataloader.
+
+    Datasets that implement ``build_sampler()`` (mixed datasets) own the global sample order: the
+    sampler is rank-agnostic (single shared seed) and accelerate shards the prepared dataloader across
+    processes. All other non-streaming datasets use ``EpisodeAwareSampler``; streaming datasets use
+    none. The order is a pure function of (seed, epoch), so resume is sample-exact for samplers that
+    expose ``load_state_dict``.
+    """
+    trainable_cfg = getattr(cfg, "trainable_config", None) or cfg.policy
+    drop_n_last_frames = int(getattr(trainable_cfg, "drop_n_last_frames", 0))
+
+    if cfg.dataset.streaming:
+        sampler = None
+        shuffle = True
+    elif hasattr(dataset, "build_sampler"):
+        loader_hints = dataset.loader_hints() if has_method(dataset, "loader_hints") else {}
+        sampler_kwargs = dict(
+            seed=cfg.seed if cfg.seed is not None else 0,
+            drop_n_last_frames=drop_n_last_frames,
+        )
+        if loader_hints.get("sampler_mode") == "source_block":
+            source_block_size = (
+                cfg.batch_size if cfg.mixed_source_block_size is None else cfg.mixed_source_block_size
+            )
+            sampler_kwargs["source_block_size"] = max(1, int(source_block_size))
+        if loader_hints.get("pass_batch_size_to_sampler"):
+            sampler_kwargs["batch_size"] = max(1, int(cfg.batch_size))
+        sampler = dataset.build_sampler(**sampler_kwargs)
+        shuffle = False
+    else:
+        sampler = EpisodeAwareSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            episode_indices_to_use=dataset.episodes,
+            drop_n_last_frames=drop_n_last_frames,
+            shuffle=True,
+            seed=cfg.seed if cfg.seed is not None else 0,
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+        )
+        shuffle = False
+
+    # Only swap in the language-aware collate when the dataset declares language columns; otherwise
+    # stay on PyTorch's default collate so non-language training runs are unaffected.
+    meta = getattr(dataset, "meta", None)
+    collate_fn = lerobot_collate_fn if getattr(meta, "has_language_columns", False) else None
+    return torch.utils.data.DataLoader(
+        dataset,
+        num_workers=cfg.num_workers,
+        batch_size=cfg.batch_size,
+        shuffle=shuffle and not cfg.dataset.streaming,
+        sampler=sampler,
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+        collate_fn=collate_fn,
+        prefetch_factor=getattr(cfg, "prefetch_factor", None) if cfg.num_workers > 0 else None,
+        persistent_workers=(cfg.num_workers > 0 and getattr(cfg, "persistent_workers", False)),
+    )
 
 
 def _restrict_policy_visual_features_to_loaded_videos(cfg: TrainPipelineConfig, dataset) -> None:
+    """Restrict the policy's input features to the video cameras actually decoded.
+
+    When ``cfg.dataset.video_keys_to_load`` selects a subset of cameras, the policy should not expect
+    visual inputs it will never receive. Only applies when input_features were not explicitly provided.
+    """
     video_keys_to_load = getattr(cfg.dataset, "video_keys_to_load", None)
     if video_keys_to_load is None or cfg.policy.input_features:
         return
@@ -76,485 +156,111 @@ def _restrict_policy_visual_features_to_loaded_videos(cfg: TrainPipelineConfig, 
     }
 
 
-def _merge_microbatch_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[str, float]:
-    merged: dict[str, float] = {}
-    if not output_dicts:
-        return merged
-
-    output_sums: dict[str, float] = {}
-    output_counts: dict[str, int] = {}
-    action_samples = 0.0
-    action_denominator = 0.0
-    latent_samples = 0.0
-    latent_denominator = 0.0
-    action_loss_numerator = 0.0
-    action_loss_denominator = 0.0
-    latent_loss_numerator = 0.0
-    latent_loss_denominator = 0.0
-
-    for output_dict in output_dicts:
-        for key, value in output_dict.items():
-            if key.startswith("_"):
-                continue
-            if key in {"action_loss", "latent_loss"}:
-                continue
-            if isinstance(value, (int, float)):
-                output_sums[key] = output_sums.get(key, 0.0) + float(value)
-                output_counts[key] = output_counts.get(key, 0) + 1
-        action_samples += float(output_dict.get("batch_action_supervised_samples", 0.0))
-        action_denominator += float(output_dict.get("_action_supervised_denominator", 0.0))
-        latent_samples += float(output_dict.get("batch_latent_supervised_samples", 0.0))
-        latent_denominator += float(output_dict.get("_latent_supervised_denominator", 0.0))
-        action_loss_denom_local = float(output_dict.get("_action_loss_denominator_exact", 0.0))
-        latent_loss_denom_local = float(output_dict.get("_latent_loss_denominator_exact", 0.0))
-        if "action_loss" in output_dict and action_loss_denom_local > 0.0:
-            action_loss_numerator += float(output_dict["action_loss"]) * action_loss_denom_local
-            action_loss_denominator += action_loss_denom_local
-        if "latent_loss" in output_dict and latent_loss_denom_local > 0.0:
-            latent_loss_numerator += float(output_dict["latent_loss"]) * latent_loss_denom_local
-            latent_loss_denominator += latent_loss_denom_local
-
-    merged.update({k: output_sums[k] / max(1, output_counts[k]) for k in output_sums})
-    if action_loss_denominator > 0.0:
-        merged["action_loss"] = action_loss_numerator / action_loss_denominator
-    if latent_loss_denominator > 0.0:
-        merged["latent_loss"] = latent_loss_numerator / latent_loss_denominator
-    if action_denominator > 0.0:
-        merged["batch_action_supervised_samples"] = action_samples
-        merged["batch_action_supervised_denominator"] = action_denominator
-        merged["batch_action_supervised_fraction"] = action_samples / action_denominator
-    if latent_denominator > 0.0:
-        merged["batch_latent_supervised_samples"] = latent_samples
-        merged["batch_latent_supervised_denominator"] = latent_denominator
-        merged["batch_latent_supervised_fraction"] = latent_samples / latent_denominator
-    return merged
-
-
-def _format_supervision_batch_log(output_dict: dict[str, Any] | None) -> str | None:
-    if not isinstance(output_dict, dict):
-        return None
-
-    parts: list[str] = []
-    action_fraction = output_dict.get("batch_action_supervised_fraction")
-    action_samples = output_dict.get("batch_action_supervised_samples")
-    action_denominator = output_dict.get("batch_action_supervised_denominator")
-    if isinstance(action_fraction, (int, float)):
-        if isinstance(action_samples, (int, float)) and isinstance(action_denominator, (int, float)):
-            parts.append(
-                f"action={float(action_fraction):.3f} ({float(action_samples):.1f}/{float(action_denominator):.1f})"
-            )
-        elif isinstance(action_samples, (int, float)):
-            parts.append(f"action={float(action_fraction):.3f} ({float(action_samples):.1f})")
-        else:
-            parts.append(f"action={float(action_fraction):.3f}")
-
-    latent_fraction = output_dict.get("batch_latent_supervised_fraction")
-    latent_samples = output_dict.get("batch_latent_supervised_samples")
-    latent_denominator = output_dict.get("batch_latent_supervised_denominator")
-    if isinstance(latent_fraction, (int, float)):
-        if isinstance(latent_samples, (int, float)) and isinstance(latent_denominator, (int, float)):
-            parts.append(
-                f"latent={float(latent_fraction):.3f} ({float(latent_samples):.1f}/{float(latent_denominator):.1f})"
-            )
-        elif isinstance(latent_samples, (int, float)):
-            parts.append(f"latent={float(latent_fraction):.3f} ({float(latent_samples):.1f})")
-        else:
-            parts.append(f"latent={float(latent_fraction):.3f}")
-
-    if not parts:
-        return None
-    return "batch_sup " + " ".join(parts)
-
-
-def _gather_accumulation_denominator_totals(
-    *,
-    accelerator: Accelerator,
-    action_total: float,
-    latent_total: float,
-) -> tuple[float, float]:
-    totals = torch.tensor(
-        [action_total, latent_total],
-        device=accelerator.device,
-        dtype=torch.float32,
-    )
-    gathered = accelerator.gather(totals)
-    if gathered.ndim == 1:
-        return float(gathered[0].item()), float(gathered[1].item())
-    summed = gathered.reshape(-1, 2).sum(dim=0)
-    return float(summed[0].item()), float(summed[1].item())
-
-
-def _build_exact_scaled_loss(
-    *,
-    output_dict: dict[str, Any],
-    action_total: float,
-    latent_total: float,
-    action_weight: float,
-    latent_weight: float,
-) -> torch.Tensor:
-    scaled_loss: torch.Tensor | None = None
-
-    action_loss = output_dict.get("_action_loss_tensor")
-    action_denom = float(output_dict.get("_action_loss_denominator_exact", 0.0))
-    if isinstance(action_loss, torch.Tensor) and action_denom > 0.0 and action_total > 0.0:
-        scaled_loss = action_loss * (action_weight * action_denom / action_total)
-
-    latent_loss = output_dict.get("_latent_loss_tensor")
-    latent_denom = float(output_dict.get("_latent_loss_denominator_exact", 0.0))
-    if isinstance(latent_loss, torch.Tensor) and latent_denom > 0.0 and latent_total > 0.0:
-        term = latent_loss * (latent_weight * latent_denom / latent_total)
-        scaled_loss = term if scaled_loss is None else (scaled_loss + term)
-
-    if scaled_loss is None:
-        for key in ("_action_loss_tensor", "_latent_loss_tensor"):
-            tensor = output_dict.get(key)
-            if isinstance(tensor, torch.Tensor):
-                return tensor * 0.0
-        raise RuntimeError("Exact accumulation requested but no supervised loss terms were available.")
-    return scaled_loss
-
-
-def _accelerator_kwargs_handlers(cfg: TrainPipelineConfig) -> list[Any]:
-    from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
-
-    kwargs_handlers: list[Any] = [DistributedDataParallelKwargs(find_unused_parameters=True)]
-    if cfg.distributed_timeout_s is not None:
-        kwargs_handlers.append(
-            InitProcessGroupKwargs(
-                timeout=dt.timedelta(seconds=float(cfg.distributed_timeout_s))
-            )
-        )
-    return kwargs_handlers
-
-
-def _load_saved_processor_step_names(
-    pretrained_path: str | Path | None,
-    processor_name: str,
-) -> set[str] | None:
-    if pretrained_path is None:
-        return None
-
-    path = Path(pretrained_path)
-    if not path.is_dir():
-        return None
-
-    config_path = path / f"{processor_name}.json"
-    if not config_path.is_file():
-        return None
-
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-    except Exception as exc:
-        logging.warning("Failed to read processor config %s: %s", config_path, exc)
-        return None
-
-    step_names: set[str] = set()
-    for step_cfg in config.get("steps", []):
-        step_name = step_cfg.get("registry_name")
-        if isinstance(step_name, str):
-            step_names.add(step_name)
-    return step_names
-
-
-def _compute_loss_and_output_dict(
-    policy: PreTrainedPolicy,
-    batch: Any,
-    accelerator: Accelerator,
-    rabc_weights_provider=None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """
-    Computes the microbatch loss and raw output dict for one forward pass.
-    """
-    rabc_batch_weights = None
-    rabc_batch_stats = None
-    if rabc_weights_provider is not None:
-        rabc_batch_weights, rabc_batch_stats = (
-            rabc_weights_provider.compute_batch_weights(batch)
-        )
-
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        if rabc_batch_weights is not None:
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
-            epsilon = 1e-6
-            loss = (per_sample_loss * rabc_batch_weights).sum() / (
-                rabc_batch_weights.sum() + epsilon
-            )
-            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
-        else:
-            loss, output_dict = policy.forward(batch)
-    return loss, output_dict
-
-
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
-    dl_iter,
-    preprocessor,
+    batch: Any,
     optimizer: Optimizer,
     grad_clip_norm: float,
-    accelerator: Accelerator,
+    accelerator: "Accelerator",
     lr_scheduler=None,
-    rabc_weights_provider=None,
-) -> tuple[MetricsTracker, dict[str, float]]:
-    """Performs one optimizer update, including internal gradient accumulation when configured."""
+    lock=None,
+    sample_weighter=None,
+) -> tuple[MetricsTracker, dict | None]:
+    """
+    Performs a single training step to update the policy's weights.
+
+    This function executes the forward and backward passes, clips gradients, and steps the optimizer and
+    learning rate scheduler. Accelerator handles mixed-precision training automatically.
+
+    Args:
+        train_metrics: A MetricsTracker instance to record training statistics.
+        policy: The policy model to be trained.
+        batch: A batch of training data.
+        optimizer: The optimizer used to update the policy's parameters.
+        grad_clip_norm: The maximum norm for gradient clipping.
+        accelerator: The Accelerator instance for distributed training and mixed precision.
+        lr_scheduler: An optional learning rate scheduler.
+        lock: An optional lock for thread-safe optimizer updates.
+        sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+
+    Returns:
+        A tuple containing:
+        - The updated MetricsTracker with new statistics for this step.
+        - A dictionary of outputs from the policy's forward pass, for logging purposes.
+    """
     start_time = time.perf_counter()
     policy.train()
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Compute sample weights if a weighter is provided
+    sample_weights = None
+    weight_stats = None
+    if sample_weighter is not None:
+        sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
+
+    # Let accelerator handle mixed precision
+    with accelerator.autocast():
+        if sample_weights is not None:
+            # Use per-sample loss for weighted training
+            # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
+            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+
+            # Weighted loss: each sample's contribution is scaled by its weight.
+            # We divide by weight sum (not batch size) so that if some weights are zero,
+            # the remaining samples contribute proportionally more, preserving gradient scale.
+            # Weights are pre-normalized to sum to batch_size for stable training dynamics.
+            epsilon = 1e-6
+            loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
+
+            # Log weighting statistics
+            if output_dict is None:
+                output_dict = {}
+            for key, value in weight_stats.items():
+                output_dict[f"sample_weight_{key}"] = value
+        else:
+            loss, output_dict = policy.forward(batch)
+
+        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+
+    # Use accelerator's backward method
+    accelerator.backward(loss)
+
+    # Clip gradients if specified
+    if grad_clip_norm > 0:
+        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), float("inf"), error_if_nonfinite=False
+        )
+
+    # Optimizer step
+    with lock if lock is not None else nullcontext():
+        optimizer.step()
+
     optimizer.zero_grad()
 
-    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-    supports_exact_accumulation = all(
-        has_method(unwrapped_policy, name)
-        for name in ("begin_training_step", "end_training_step", "get_accumulation_denominators")
-    )
+    # Step through pytorch scheduler at every batch instead of epoch
+    if lr_scheduler is not None:
+        lr_scheduler.step()
 
-    dataloading_total_s = 0.0
-    prefetched_batches: list[Any] = []
-    prefetched_denominators: list[dict[str, float]] = []
-    microbatch_output_dicts: list[dict[str, Any]] = []
-    logged_loss_value = 0.0
-    grad_norm_value = 0.0
+    # Update internal buffers if policy has update method
+    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    accum_steps = max(1, int(accelerator.gradient_accumulation_steps))
-    if supports_exact_accumulation:
-        unwrapped_policy.begin_training_step()
-    try:
-        for _ in range(accum_steps):
-            data_start = time.perf_counter()
-            batch = next(dl_iter)
-            batch = preprocessor(batch)
-            dataloading_total_s += time.perf_counter() - data_start
-            prefetched_batches.append(batch)
-            if supports_exact_accumulation:
-                prefetched_denominators.append(unwrapped_policy.get_accumulation_denominators(batch))
-
-        action_total = 0.0
-        latent_total = 0.0
-        if supports_exact_accumulation:
-            action_total = sum(item["action"] for item in prefetched_denominators)
-            latent_total = sum(item["latent"] for item in prefetched_denominators)
-            if accelerator.num_processes > 1:
-                action_total, latent_total = _gather_accumulation_denominator_totals(
-                    accelerator=accelerator,
-                    action_total=action_total,
-                    latent_total=latent_total,
-                )
-
-        total_loss_value = 0.0
-        for batch in prefetched_batches:
-            with accelerator.accumulate(policy):
-                loss, output_dict_local = _compute_loss_and_output_dict(
-                    policy,
-                    batch,
-                    accelerator=accelerator,
-                    rabc_weights_provider=rabc_weights_provider,
-                )
-                if supports_exact_accumulation:
-                    scaled_loss = _build_exact_scaled_loss(
-                        output_dict=output_dict_local,
-                        action_total=action_total,
-                        latent_total=latent_total,
-                        action_weight=float(getattr(unwrapped_policy.config, "action_loss_weight", 1.0)),
-                        latent_weight=float(getattr(unwrapped_policy.config, "latent_loss_weight", 1.0)),
-                    )
-                    total_loss_value += float(scaled_loss.detach().item())
-                    accelerator.backward(scaled_loss)
-                else:
-                    total_loss_value += float(loss.item())
-                    accelerator.backward(loss)
-
-                if accelerator.sync_gradients:
-                    if has_method(unwrapped_policy, "get_gradient_metrics"):
-                        if output_dict_local is None:
-                            output_dict_local = {}
-                        output_dict_local.update(unwrapped_policy.get_gradient_metrics())
-                    if grad_clip_norm > 0:
-                        grad_norm = accelerator.clip_grad_norm_(
-                            policy.parameters(), grad_clip_norm
-                        )
-                    else:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            policy.parameters(), float("inf"), error_if_nonfinite=False
-                        )
-                    grad_norm_value = float(grad_norm.item())
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    if lr_scheduler is not None:
-                        lr_scheduler.step()
-                    if has_method(unwrapped_policy, "update"):
-                        unwrapped_policy.update()
-
-            if output_dict_local:
-                stored_output_dict = dict(output_dict_local)
-                stored_output_dict.pop("_action_loss_tensor", None)
-                stored_output_dict.pop("_latent_loss_tensor", None)
-                microbatch_output_dicts.append(stored_output_dict)
-
-        if not accelerator.sync_gradients:
-            raise RuntimeError("Gradient accumulation window ended without an optimizer step.")
-        logged_loss_value = total_loss_value if supports_exact_accumulation else (total_loss_value / float(accum_steps))
-    finally:
-        if supports_exact_accumulation:
-            unwrapped_policy.end_training_step()
-
-    train_metrics.loss = logged_loss_value
-    train_metrics.grad_norm = grad_norm_value
+    train_metrics.loss = loss.item()
+    train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
-    train_metrics.dataloading_s = dataloading_total_s
-    return train_metrics, _merge_microbatch_output_dicts(microbatch_output_dicts)
-
-
-def get_default_peft_configuration(policy_type):
-    """Build a basic PEFT configuration for the given policy type assuming that we train a policy from a checkpoint."""
-
-    common_projections = "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-
-    if policy_type == "smolvla":
-        return {
-            "target_modules": rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))",
-            "modules_to_save": [],
-        }
-    elif policy_type in ("pi0", "pi05"):
-        return {
-            "target_modules": rf"(.*\.gemma_expert\..*\.self_attn.(q|v)_proj|model\.({common_projections}))",
-            "modules_to_save": [],
-        }
-
-    return {"modules_to_save": None}
-
-
-def wrap_policy_in_peft_model(cfg, policy):
-    from peft import PEFT_TYPE_TO_CONFIG_MAPPING, PeftType, get_peft_model
-
-    # Disable all gradients because we'll only train the parameters selected by the PEFT method.
-    # Layers that should receive gradients anyway need to be listed in `modules_to_save`.
-    for p in policy.parameters():
-        p.requires_grad_(False)
-
-    if not cfg.policy.pretrained_path:
-        raise ValueError(
-            "Training from scratch using PEFT. This is unlikely to yield good results. "
-            "Supply a `policy.path` to fine-tune an existing model."
-        )
-
-    if cfg.policy.type == "smolvla" and not cfg.policy.load_vlm_weights:
-        logging.warning(
-            "Training SmolVLA from scratch using PEFT. This is unlikely to yield good results. Set "
-            "`load_vlm_weights=True` to fine-tune the existing policy."
-        )
-
-    peft_config_policy = get_default_peft_configuration(cfg.policy.type)
-    peft_config_cli = dataclasses.asdict(cfg.peft) if cfg.peft else {}
-    peft_config_cli["modules_to_save"] = peft_config_cli[
-        "full_training_modules"
-    ]  # compatibility with PEFT
-    peft_method_type = PeftType[peft_config_cli["method_type"].upper()]
-    peft_config_cls = PEFT_TYPE_TO_CONFIG_MAPPING[peft_method_type]
-
-    # Handle specific CLI overrides
-    for key in ["target_modules", "modules_to_save", "r"]:
-        if peft_config_cli[key] is not None:
-            peft_config_policy[key] = peft_config_cli[key]
-
-    if "target_modules" not in peft_config_policy:
-        raise ValueError(
-            f"There is no default `target_modules` value for policy {cfg.policy.type}. Please pass it manually."
-        )
-
-    # Init method depends on the used PEFT method, your specific PEFT method
-    # might not be considered here, in that case an error is raised.
-    if peft_config_cli["init_type"] is not None:
-        if peft_method_type == "LORA":
-            peft_config_policy["init_lora_weights"] = peft_config_cli["init_type"]
-        elif peft_method_type == "MISS":
-            peft_config_policy["init_weights"] = peft_config_cli["init_type"]
-        else:
-            raise ValueError(
-                f"Init type {peft_config_cli['init_type']} unknown for PEFT method {peft_method_type}."
-            )
-
-    # PEFT uses this attribute to set adapter_config.base_name_or_path which we use for loading the
-    # correct base model in `make_policy` since in a PEFT loading setting we only get the path to the
-    # adapter, not the base model.
-    if policy.config.pretrained_path:
-        policy.name_or_path = str(policy.config.pretrained_path)
-
-    # Finally wrap the policy in a PEFT model
-    policy = get_peft_model(
-        policy,
-        peft_config_cls(**peft_config_policy),
-    )
-
-    # Make sure that the config is tagged as using PEFT so that the loading code can take the
-    # appropriate steps to use the adapter weights and the PEFT config instead of the full model weights.
-    policy.config.use_peft = True
-
-    return policy
-
-
-def make_offline_dataloader(
-    cfg: TrainPipelineConfig,
-    dataset,
-    *,
-    device: torch.device,
-) -> torch.utils.data.DataLoader:
-    """Create the offline-training dataloader.
-
-    Datasets that implement `build_sampler()` own the global sample order. The sampler receives a shared
-    seed and must stay rank-agnostic; Accelerate shards the prepared dataloader across processes.
-    """
-
-    drop_n_last_frames = int(getattr(cfg.policy, "drop_n_last_frames", 0))
-    sampler = None
-    shuffle = True
-    loader_hints = dataset.loader_hints() if has_method(dataset, "loader_hints") else {}
-    is_mixed_dataset = bool(loader_hints.get("is_mixed", False))
-    prefetch_factor = int(loader_hints.get("prefetch_factor", 2))
-
-    if hasattr(dataset, "build_sampler"):
-        sampler_kwargs = dict(
-            seed=0 if cfg.seed is None else int(cfg.seed),
-            drop_n_last_frames=drop_n_last_frames,
-        )
-        if loader_hints.get("sampler_mode") == "source_block":
-            source_block_size = (
-                cfg.batch_size
-                if cfg.mixed_source_block_size is None
-                else cfg.mixed_source_block_size
-            )
-            sampler_kwargs["source_block_size"] = max(1, int(source_block_size))
-        if loader_hints.get("pass_batch_size_to_sampler"):
-            sampler_kwargs["batch_size"] = max(1, int(cfg.batch_size))
-        sampler = dataset.build_sampler(**sampler_kwargs)
-        shuffle = False
-    elif hasattr(cfg.policy, "drop_n_last_frames"):
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=drop_n_last_frames,
-            shuffle=True,
-        )
-        shuffle = False
-
-    return torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        prefetch_factor=prefetch_factor if cfg.num_workers > 0 else None,
-    )
+    if torch.cuda.is_available():
+        train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    return train_metrics, output_dict
 
 
 @parser.wrap()
-def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     """
     Main function to train a policy.
 
@@ -570,6 +276,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
+    from lerobot.utils.import_utils import require_package
+
+    require_package("accelerate", extra="training")
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs, DistributedType
+
     cfg.validate()
 
     # Create Accelerator if not provided
@@ -577,13 +289,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        kwargs_handlers: list[Any] = [ddp_kwargs]
+        # Raise the process-group timeout for slow cluster collectives (default is 30 min in NCCL).
+        if cfg.distributed_timeout_s is not None:
+            from accelerate.utils import InitProcessGroupKwargs
+
+            kwargs_handlers.append(
+                InitProcessGroupKwargs(timeout=dt.timedelta(seconds=float(cfg.distributed_timeout_s)))
+            )
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
-        # Force the device to be CPU when policy.device is set to CPU.
-        force_cpu = cfg.policy.device == "cpu"
+        # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
+        force_cpu = cfg.trainable_config.device == "cpu"
         accelerator = Accelerator(
-            gradient_accumulation_steps=max(1, int(getattr(cfg, "grad_accum_steps", 1))),
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=_accelerator_kwargs_handlers(cfg),
+            kwargs_handlers=kwargs_handlers,
             cpu=force_cpu,
         )
 
@@ -603,9 +323,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     else:
         wandb_logger = None
         if is_main_process:
-            logging.info(
-                colored("Logs will be saved locally.", "yellow", attrs=["bold"])
-            )
+            logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
         set_seed(cfg.seed, accelerator=accelerator)
@@ -619,155 +337,152 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Dataset loading synchronization: main process downloads first to avoid race conditions
+    # Dataset loading synchronization: the global main process downloads once to the shared
+    # dataset root, then a barrier lets every other rank read the already-populated copy.
+    # LeRobotDataset skips its snapshot_download when try_load() succeeds, so no rank re-downloads.
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+        dataset, eval_dataset = make_train_eval_datasets(cfg)
 
     accelerator.wait_for_everyone()
 
-    # Now all other processes can safely load the dataset
+    # Other ranks read from the shared copy populated by the main process.
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        dataset, eval_dataset = make_train_eval_datasets(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
     eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
+    if cfg.env_eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
-        eval_env = make_env(
-            cfg.env,
-            n_envs=cfg.eval.batch_size,
-            use_async_envs=cfg.eval.use_async_envs,
-            async_env_context=cfg.eval.async_env_context,
+        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+
+    if cfg.is_reward_model_training:
+        if is_main_process:
+            logging.info("Creating reward model")
+        from lerobot.rewards import make_reward_model
+
+        policy = make_reward_model(
+            cfg=cfg.reward_model,
+            dataset_stats=dataset.meta.stats,
+            dataset_meta=dataset.meta,
         )
-
-    _restrict_policy_visual_features_to_loaded_videos(cfg, dataset)
-
-    if is_main_process:
-        logging.info("Creating policy")
-    policy = make_policy(
-        cfg=cfg.policy,
-        ds_meta=dataset.meta,
-        rename_map=cfg.rename_map,
-    )
+        if not policy.is_trainable:
+            raise ValueError(
+                f"Reward model '{policy.name}' is zero-shot and cannot be trained via lerobot-train. "
+                "Use it directly for inference via compute_reward() (e.g. offline precompute)."
+            )
+    else:
+        if is_main_process:
+            logging.info("Creating policy")
+        # If only a subset of video cameras is decoded, scope the policy's input features to match.
+        _restrict_policy_visual_features_to_loaded_videos(cfg, dataset)
+        policy = make_policy(
+            cfg=cfg.policy,
+            ds_meta=dataset.meta,
+            rename_map=cfg.rename_map,
+        )
 
     if cfg.peft is not None:
-        logging.info("Using PEFT! Wrapping model.")
-        # Convert CLI peft config to dict for overrides
-        peft_cli_overrides = dataclasses.asdict(cfg.peft)
-        policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
+        if cfg.is_reward_model_training:
+            raise ValueError("PEFT is only supported for policy training. ")
+        from peft import PeftModel
 
-    # Wait for all processes to finish policy creation before continuing
+        if isinstance(policy, PeftModel):
+            logging.info("PEFT adapter already loaded from checkpoint, skipping wrap_with_peft.")
+        else:
+            logging.info("Using PEFT! Wrapping model.")
+            peft_cli_overrides = dataclasses.asdict(cfg.peft)
+            policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
+
+    # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
-    # Create processors - only provide dataset_stats if not resuming from saved processors
+    active_cfg = cfg.trainable_config
+    processor_pretrained_path = active_cfg.pretrained_path
+
     processor_kwargs = {}
-    postprocessor_kwargs = {}
-    if (
-        cfg.policy.pretrained_path and not cfg.resume
-    ) or not cfg.policy.pretrained_path:
-        # Only provide dataset_stats when not resuming from saved processor state
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    # For SARM, always provide dataset_meta for progress normalization
-    if cfg.policy.type == "sarm":
+    if cfg.is_reward_model_training:
         processor_kwargs["dataset_meta"] = dataset.meta
 
-    if cfg.policy.pretrained_path is not None:
-        preprocessor_step_names = _load_saved_processor_step_names(
-            cfg.policy.pretrained_path, POLICY_PREPROCESSOR_DEFAULT_NAME
-        )
-        postprocessor_step_names = _load_saved_processor_step_names(
-            cfg.policy.pretrained_path, POLICY_POSTPROCESSOR_DEFAULT_NAME
-        )
-
-        preprocessor_overrides: dict[str, Any] = {}
-        if preprocessor_step_names is None or "device_processor" in preprocessor_step_names:
-            preprocessor_overrides["device_processor"] = {"device": device.type}
-        if (
-            preprocessor_step_names is None
-            or "rename_observations_processor" in preprocessor_step_names
-        ):
-            preprocessor_overrides["rename_observations_processor"] = {"rename_map": cfg.rename_map}
-
-        if not cfg.resume and (
-            preprocessor_step_names is None or "normalizer_processor" in preprocessor_step_names
-        ):
-            preprocessor_overrides["normalizer_processor"] = {
+    if not cfg.is_reward_model_training and processor_pretrained_path is not None:
+        preprocessor_overrides = {
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
                 "stats": dataset.meta.stats,
-                "features": {
-                    **policy.config.input_features,
-                    **policy.config.output_features,
-                },
+                "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
+            },
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        postprocessor_overrides = {
+            "unnormalizer_processor": {
+                "stats": dataset.meta.stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+        if getattr(active_cfg, "use_relative_actions", False):
+            preprocessor_overrides["relative_actions_processor"] = {
+                "enabled": True,
+                "exclude_joints": getattr(active_cfg, "relative_exclude_joints", []),
+                "action_names": getattr(active_cfg, "action_feature_names", None),
             }
+            postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
+        processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
-        if not cfg.resume and (
-            postprocessor_step_names is None or "unnormalizer_processor" in postprocessor_step_names
-        ):
-            postprocessor_kwargs["postprocessor_overrides"] = {
-                "unnormalizer_processor": {
-                    "stats": dataset.meta.stats,
-                    "features": policy.config.output_features,
-                    "norm_map": policy.config.normalization_mapping,
-                },
-            }
-
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
-        **processor_kwargs,
-        **postprocessor_kwargs,
-    )
+    if cfg.is_reward_model_training:
+        preprocessor, postprocessor = make_reward_pre_post_processors(
+            cfg.reward_model,
+            **processor_kwargs,
+        )
+    else:
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=cfg.policy,
+            pretrained_path=processor_pretrained_path,
+            pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
+            **processor_kwargs,
+        )
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
-    # Load precomputed SARM progress for RA-BC if enabled
-    # Generate progress using: src/lerobot/policies/sarm/compute_rabc_weights.py
-    rabc_weights = None
-    if cfg.use_rabc:
-        from lerobot.utils.rabc import RABCWeights
+    # Create sample weighter if configured (e.g., for RA-BC training)
+    sample_weighter = None
+    if cfg.sample_weighting is not None:
+        from lerobot.utils.sample_weighting import make_sample_weighter
 
-        # Get chunk_size from policy config
-        chunk_size = getattr(policy.config, "chunk_size", None)
-        if chunk_size is None:
-            raise ValueError("Chunk size is not found in policy config")
-
-        head_mode = getattr(cfg, "rabc_head_mode", "sparse")
-        logging.info(f"Loading SARM progress for RA-BC from {cfg.rabc_progress_path}")
-        logging.info(
-            f"Using chunk_size={chunk_size} from policy config, head_mode={head_mode}"
-        )
-        rabc_weights = RABCWeights(
-            progress_path=cfg.rabc_progress_path,
-            chunk_size=chunk_size,
-            head_mode=head_mode,
-            kappa=getattr(cfg, "rabc_kappa", 0.01),
-            epsilon=getattr(cfg, "rabc_epsilon", 1e-6),
-            device=device,
+        if is_main_process:
+            logging.info(f"Creating sample weighter: {cfg.sample_weighting.type}")
+        sample_weighter = make_sample_weighter(
+            cfg.sample_weighting,
+            policy,
+            device,
+            dataset_root=cfg.dataset.root,
+            dataset_repo_id=cfg.dataset.repo_id,
         )
 
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
+        # Under FSDP the optimizer state is sharded and must be loaded after `accelerator.prepare()`
+        # (see load_fsdp_optimizer_state below), so skip the optimizer here and load it then.
+        is_fsdp = accelerator.distributed_type == DistributedType.FSDP
         step, optimizer, lr_scheduler = load_training_state(
-            cfg.checkpoint_path, optimizer, lr_scheduler
+            cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
         )
 
-    num_learnable_params = sum(
-        p.numel() for p in policy.parameters() if p.requires_grad
-    )
+    num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
     if is_main_process:
-        logging.info(
-            colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}"
-        )
+        logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
@@ -778,43 +493,109 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        grad_accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1)))
-        effective_bs = cfg.batch_size * grad_accum_steps * num_processes
-        if grad_accum_steps > 1:
-            logging.info(
-                f"Effective batch size: {cfg.batch_size} x {grad_accum_steps} x {num_processes} = {effective_bs}"
-            )
-        else:
-            logging.info(
-                f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}"
-            )
-        logging.info(
-            f"{num_learnable_params=} ({format_big_number(num_learnable_params)})"
-        )
+        effective_bs = cfg.batch_size * num_processes
+        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    # create dataloader for offline training
     dataloader = make_offline_dataloader(cfg, dataset, device=device)
+    sampler = dataloader.sampler
+    if cfg.resume and step > 0 and sampler is not None and hasattr(sampler, "load_state_dict"):
+        # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
+        # use the values recorded in the checkpoint (falling back to the current ones for older
+        # ckpts that did not store them).
+        saved_num_processes = load_training_num_processes(cfg.checkpoint_path)
+        saved_batch_size = load_training_batch_size(cfg.checkpoint_path)
+        ckpt_num_processes = saved_num_processes or accelerator.num_processes
+        ckpt_batch_size = saved_batch_size or cfg.batch_size
+        if is_main_process and saved_num_processes not in (None, accelerator.num_processes):
+            logging.warning(
+                f"Resuming with num_processes={accelerator.num_processes} but the checkpoint was "
+                f"written with num_processes={saved_num_processes}. The data order resumes at the "
+                "right epoch/offset, but per-rank sample-exactness requires the same world size."
+            )
+        if is_main_process and saved_batch_size not in (None, cfg.batch_size):
+            logging.warning(
+                f"Resuming with batch_size={cfg.batch_size} but the checkpoint was written with "
+                f"batch_size={saved_batch_size}. The data order resumes at the right epoch/offset, "
+                "but per-rank sample-exactness requires the same batch size."
+            )
+        sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_num_processes)
+        sampler.load_state_dict(sampler_state)
+        if is_main_process:
+            logging.info(
+                f"Resuming data order at epoch {sampler_state['epoch']}, "
+                f"sample {sampler_state['start_index']}"
+            )
+
+    # Build eval dataloader if a held-out split exists
+    eval_dataloader = None
+    if eval_dataset is not None:
+        eval_ds = eval_dataset
+        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
+            task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
+            unique_tasks = sorted(set(task_arr.tolist()))
+            per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
+            selected: list[int] = []
+            for t in unique_tasks:
+                frames = (task_arr == t).nonzero()[0][:per_task]
+                selected.extend(frames.tolist())
+            eval_ds = torch.utils.data.Subset(eval_dataset, selected)
+
+        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            collate_fn=eval_collate_fn,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if eval_dataloader is not None:
+        policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler, eval_dataloader
+        )
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
+
+    # FSDP optimizer state is sharded across ranks, so it can only be loaded once the optimizer and
+    # model are FSDP-wrapped (i.e. after `prepare`). Collective: every rank must participate.
+    if cfg.resume and accelerator.distributed_type == DistributedType.FSDP:
+        load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
+
     dl_iter = cycle(dataloader)
 
     policy.train()
 
     train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
+        # Per-rank loss reflects only one shard of the global batch; mean recovers the loss DDP
+        # is actually optimizing. grad_norm and lr are already identical on every rank (post
+        # gradient sync / deterministic scheduler) so reducing them would be a no-op collective.
+        "loss": AverageMeter("loss", ":.3f", reduction="mean"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
+        # Report the slowest rank for bottleneck-style timings so multi-GPU runs surface the
+        # true straggler instead of rank 0's view.
+        "update_s": AverageMeter("updt_s", ":.3f", reduction="max"),
+        "dataloading_s": AverageMeter("data_s", ":.3f", reduction="max"),
+        # Derived from the post-reduce max step time; set once per log window on the main rank.
+        "samples_per_s": AverageMeter("smp/s", ":.0f"),
     }
+    if torch.cuda.is_available():
+        # max() because headroom is gated by the worst-case rank.
+        train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
 
-    grad_accum_steps = max(1, int(getattr(cfg, "grad_accum_steps", 1)))
-    # Use effective batch size for proper epoch calculation in distributed training
-    effective_batch_size = cfg.batch_size * grad_accum_steps * accelerator.num_processes
+    # Keep global batch size for logging; MetricsTracker handles world size internally.
+    effective_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
         cfg.batch_size,
         dataset.num_frames,
@@ -838,16 +619,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
     for _ in range(step, cfg.steps):
+        start_time = time.perf_counter()
+        batch = next(dl_iter)
+        for cam_key in dataset.meta.camera_keys:
+            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+        batch = preprocessor(batch)
+        train_tracker.dataloading_s = time.perf_counter() - start_time
+
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
-            dl_iter,
-            preprocessor,
+            batch,
             optimizer,
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
-            rabc_weights_provider=rabc_weights,
+            sample_weighter=sample_weighter,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -856,43 +644,67 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if is_main_process:
             progbar.update(1)
         train_tracker.step()
-        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
-        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
+        is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
 
         if is_log_step:
-            logging.info(train_tracker)
-            supervision_log = _format_supervision_batch_log(output_dict)
-            if supervision_log is not None:
-                logging.info(supervision_log)
-            if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    # Filter out internal tensors (prefixed with _) from scalar logging
-                    scalar_dict = {
-                        k: v for k, v in output_dict.items() if not k.startswith("_")
-                    }
-                    wandb_log_dict.update(scalar_dict)
-                # Log RA-BC statistics if enabled
-                if rabc_weights is not None:
-                    rabc_stats = rabc_weights.get_stats()
-                    wandb_log_dict.update(
-                        {
-                            "rabc_delta_mean": rabc_stats["delta_mean"],
-                            "rabc_delta_std": rabc_stats["delta_std"],
-                            "rabc_num_frames": rabc_stats["num_frames"],
-                        }
-                    )
-                wandb_logger.log_dict(wandb_log_dict, step)
-
+            # Collective reduce must run on every rank, before the main-process gate below.
+            train_tracker.reduce_across_ranks()
+            if is_main_process:
+                # Cluster-wide throughput, derived from the already-reduced (max) step time so it
+                # reflects the slowest rank — which is what actually gates the next iteration.
+                step_time = train_tracker.update_s.avg + train_tracker.dataloading_s.avg
+                if step_time > 0:
+                    train_tracker.samples_per_s = effective_batch_size / step_time
+                logging.info(train_tracker)
+                if wandb_logger:
+                    wandb_log_dict = train_tracker.to_dict()
+                    if output_dict:
+                        wandb_log_dict.update(output_dict)
+                    # Log sample weighting statistics if enabled
+                    if sample_weighter is not None:
+                        weighter_stats = sample_weighter.get_stats()
+                        wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+                    wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+        if is_eval_step:
+            policy.eval()
+            eval_loss_sum = 0.0
+            n_eval_batches = 0
+            with torch.no_grad(), accelerator.autocast():
+                for eval_batch in eval_dataloader:
+                    for cam_key in dataset.meta.camera_keys:
+                        if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
+                            eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
+                    eval_batch = preprocessor(eval_batch)
+                    loss, _ = policy.forward(eval_batch)
+                    eval_loss_sum += loss.item()
+                    n_eval_batches += 1
+            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
+            eval_loss = torch.tensor(eval_loss, device=device)
+            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            policy.train()
+
+            if is_main_process:
+                logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                if wandb_logger:
+                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+
         if cfg.save_checkpoint and is_saving_step:
+            # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
+            # so all ranks must participate; rank 0 then writes the materialized dicts. For DDP /
+            # single-GPU the state dicts are saved the normal way inside save_checkpoint.
+            is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+            if is_fsdp:
+                model_state_dict, optim_state_dict = gather_fsdp_state_dicts(policy, optimizer)
+            else:
+                model_state_dict, optim_state_dict = None, None
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(
-                    cfg.output_dir, cfg.steps, step
-                )
+                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -902,6 +714,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     scheduler=lr_scheduler,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
+                    num_processes=accelerator.num_processes,
+                    batch_size=cfg.batch_size,
+                    model_state_dict=model_state_dict,
+                    optim_state_dict=optim_state_dict,
                 )
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
@@ -909,7 +725,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             accelerator.wait_for_everyone()
 
-        if cfg.env and is_eval_step:
+        if cfg.env and is_env_eval_step:
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
@@ -954,9 +770,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(
-                        eval_info["overall"]["video_paths"][0], step, mode="eval"
-                    )
+                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 
@@ -966,17 +780,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if eval_env:
         close_envs(eval_env)
 
+    is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+    model_state_dict = accelerator.get_state_dict(policy) if is_fsdp else None
     if is_main_process:
         logging.info("End of training")
 
-        if cfg.policy.push_to_hub:
-            unwrapped_policy = accelerator.unwrap_model(policy)
-            if cfg.policy.use_peft:
-                unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
+        if getattr(active_cfg, "push_to_hub", False):
+            unwrapped_model = accelerator.unwrap_model(policy)
+            # PEFT only applies when training a policy — reward models use the plain path.
+            if not cfg.is_reward_model_training and cfg.policy.use_peft:
+                unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model)
             else:
-                unwrapped_policy.push_model_to_hub(cfg)
-            preprocessor.push_to_hub(cfg.policy.repo_id)
-            postprocessor.push_to_hub(cfg.policy.repo_id)
+                unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict)
+            preprocessor.push_to_hub(active_cfg.repo_id)
+            postprocessor.push_to_hub(active_cfg.repo_id)
 
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()

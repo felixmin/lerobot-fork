@@ -582,10 +582,10 @@ class CompactSourceAdapter:
         *,
         anchor_abs_index: int,
     ) -> dict[str, Any]:
-        if dataset._absolute_to_relative_idx is None:
+        if dataset.absolute_to_relative_idx is None:
             relative_index = int(anchor_abs_index)
         else:
-            relative_index = int(dataset._absolute_to_relative_idx[int(anchor_abs_index)])
+            relative_index = int(dataset.absolute_to_relative_idx[int(anchor_abs_index)])
         return self._adapt_item(dataset[relative_index])
 
     def fetch_many(
@@ -607,15 +607,16 @@ class CompactSourceAdapter:
             return [self.fetch_one(dataset, anchor_abs_index=int(anchor_abs_indices[0]))]
 
         t_before_ensure = time.perf_counter() if profile_this_call else 0.0
-        dataset._ensure_hf_dataset_loaded()
+        if dataset.reader.hf_dataset is None:
+            dataset.reader.load_and_activate()
         t_after_ensure = time.perf_counter() if profile_this_call else 0.0
         records: list[dict[str, Any]] = []
         relative_indices: list[int] = []
         for anchor_abs_index in anchor_abs_indices:
-            if dataset._absolute_to_relative_idx is None:
+            if dataset.absolute_to_relative_idx is None:
                 relative_index = int(anchor_abs_index)
             else:
-                relative_index = int(dataset._absolute_to_relative_idx[int(anchor_abs_index)])
+                relative_index = int(dataset.absolute_to_relative_idx[int(anchor_abs_index)])
             relative_indices.append(relative_index)
 
             item = dict(dataset.hf_dataset[relative_index])
@@ -623,8 +624,8 @@ class CompactSourceAdapter:
             abs_idx = int(item["index"].item())
             query_indices = None
             padding: dict[str, torch.Tensor] = {}
-            if dataset.delta_indices is not None:
-                query_indices, padding = dataset._get_query_indices(abs_idx, ep_idx)
+            if dataset.reader.delta_indices is not None:
+                query_indices, padding = dataset.reader._get_query_indices(abs_idx, ep_idx)
             records.append(
                 {
                     "item": item,
@@ -632,7 +633,7 @@ class CompactSourceAdapter:
                     "abs_idx": abs_idx,
                     "query_indices": query_indices,
                     "padding": padding,
-                    "query_timestamps": dataset._get_query_timestamps(
+                    "query_timestamps": dataset.reader._get_query_timestamps(
                         float(item["timestamp"].item()),
                         query_indices,
                     ),
@@ -640,7 +641,7 @@ class CompactSourceAdapter:
             )
         t_after_plan = time.perf_counter() if profile_this_call else 0.0
 
-        if dataset.delta_indices is not None:
+        if dataset.reader.delta_indices is not None:
             non_video_query_indices: dict[str, list[int]] = {}
             for record in records:
                 query_indices = record["query_indices"]
@@ -652,7 +653,7 @@ class CompactSourceAdapter:
                     non_video_query_indices.setdefault(key, []).extend(values)
 
             if non_video_query_indices:
-                non_video_results = dataset._query_hf_dataset(non_video_query_indices)
+                non_video_results = dataset.reader._query_hf_dataset(non_video_query_indices)
                 key_offsets = {key: 0 for key in non_video_query_indices}
                 for record in records:
                     query_indices = record["query_indices"]
@@ -679,7 +680,7 @@ class CompactSourceAdapter:
                     ts_group.setdefault(key, []).extend(timestamps)
 
             for ep_idx, timestamps_by_key in video_timestamps.items():
-                decoded_by_key = dataset._query_videos(timestamps_by_key, ep_idx)
+                decoded_by_key = dataset.reader._query_videos(timestamps_by_key, ep_idx)
                 for key, requests in video_requests[ep_idx].items():
                     start = 0
                     decoded = decoded_by_key[key]
@@ -856,7 +857,10 @@ def _build_compact_mixed_info(
     sources: Sequence[CompactSourceAdapter],
     manifest: CompactManifest,
 ) -> dict[str, Any]:
-    info = deepcopy(sources[0].meta.info)
+    # Upstream's meta.info is a DatasetInfo dataclass that rejects unknown keys; work on a plain dict
+    # so we can attach mix-specific metadata (mixed_sources, mix_path, ...).
+    base_info = sources[0].meta.info
+    info = deepcopy(base_info.to_dict() if hasattr(base_info, "to_dict") else dict(base_info))
     source_metadata: list[dict[str, Any]] = []
     total_effective_episodes = 0
     for source in sources:

@@ -969,11 +969,11 @@ class LogicalSource:
 
     def get_item(self, anchor_abs_index: int) -> dict[str, Any]:
         dataset = self._get_dataset()
-        if dataset._absolute_to_relative_idx is None:
+        if dataset.absolute_to_relative_idx is None:
             relative_index = int(anchor_abs_index)
         else:
             relative_index = int(
-                dataset._absolute_to_relative_idx[int(anchor_abs_index)]
+                dataset.absolute_to_relative_idx[int(anchor_abs_index)]
             )
         if _debug_mixed_dataset():
             logger.info(
@@ -1059,7 +1059,10 @@ def _build_mixed_info(
     mix_path: Path,
     sources: list[LogicalSource],
 ) -> dict[str, Any]:
-    info = deepcopy(sources[0].meta.info)
+    # Upstream's meta.info is a DatasetInfo dataclass that rejects unknown keys; work on a plain dict
+    # so we can attach mix-specific metadata (mixed_sources, mix_path, ...).
+    base_info = sources[0].meta.info
+    info = deepcopy(base_info.to_dict() if hasattr(base_info, "to_dict") else dict(base_info))
     info["total_episodes"] = int(sum(source.num_episodes for source in sources))
     info["total_frames"] = int(sum(source.num_frames for source in sources))
     info["mixed_sources"] = [

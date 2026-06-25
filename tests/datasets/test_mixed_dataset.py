@@ -414,7 +414,7 @@ def test_compact_source_opens_full_physical_dataset_for_logical_splits(tmp_path)
     physical_dataset = source.make_dataset()
 
     assert physical_dataset.episodes is None
-    assert physical_dataset._absolute_to_relative_idx is None
+    assert physical_dataset.absolute_to_relative_idx is None
 
     anchor_abs_index = source.flat_index_to_anchor(0)
     item = source.fetch_one(physical_dataset, anchor_abs_index=anchor_abs_index)

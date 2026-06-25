@@ -14,6 +14,8 @@
 import pytest
 from types import SimpleNamespace
 
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
