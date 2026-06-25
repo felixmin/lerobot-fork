@@ -56,6 +56,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions_aloha: bool = False
 
+    # Converts action targets to values relative to the current observation.state
+    # before normalization, then converts predicted relative actions back to
+    # absolute actions during inference. Mirrors the pi0 relative-action processor
+    # path for DK1 EE control. Gripper dimensions stay absolute.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    action_feature_names: list[str] | None = None
+
     # Tokenizer
     tokenizer_max_length: int = 48
 

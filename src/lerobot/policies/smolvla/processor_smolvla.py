@@ -19,12 +19,14 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NewLineTaskProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
@@ -66,6 +68,13 @@ def make_smolvla_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    relative_step = RelativeActionsProcessorStep(
+        enabled=getattr(config, "use_relative_actions", False),
+        exclude_joints=getattr(config, "relative_exclude_joints", []),
+        action_names=getattr(config, "action_feature_names", None),
+    )
+
+    # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
@@ -77,6 +86,7 @@ def make_smolvla_pre_post_processors(
             max_length=config.tokenizer_max_length,
         ),
         DeviceProcessorStep(device=config.device),
+        relative_step,
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
@@ -86,6 +96,10 @@ def make_smolvla_pre_post_processors(
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+        ),
+        AbsoluteActionsProcessorStep(
+            enabled=getattr(config, "use_relative_actions", False),
+            relative_step=relative_step,
         ),
         DeviceProcessorStep(device="cpu"),
     ]
