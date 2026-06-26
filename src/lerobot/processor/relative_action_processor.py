@@ -52,6 +52,10 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
     state_offset = state[..., :dims] * mask_t
+    # state may carry an observation-step axis (B, n_obs, state_dim); use the most recent
+    # step and collapse to (B, state_dim) so it broadcasts against the action chunk.
+    while state_offset.ndim > 2:
+        state_offset = state_offset[:, -1]
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
@@ -74,6 +78,10 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
     state_offset = state[..., :dims] * mask_t
+    # state may carry an observation-step axis (B, n_obs, state_dim); use the most recent
+    # step and collapse to (B, state_dim) so it broadcasts against the action chunk.
+    while state_offset.ndim > 2:
+        state_offset = state_offset[:, -1]
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
